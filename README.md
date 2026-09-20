@@ -117,6 +117,11 @@ ajs submit --cpu 8 -- sh -c 'cargo test --release -j $AJS_CPU'
   another agent's one job.
 - **Leases** (`acquire_lease`) for work that must run inside the agent's own process.
   Heartbeat-based, so a dead agent's hold is reclaimed rather than wedging the queue.
+- **GPU by VRAM.** The card is scheduled on memory, not device count: `--gpu 1 --gpu-mem
+  2G` lets two such jobs share a 4 GB card, while `--gpu 1` alone reserves all of it
+  (safe, but serialising). `--gpu-exclusive` is a separate switch from `--exclusive`, so
+  a CPU benchmark does not idle the GPU and vice versa. Jobs that do not ask for the GPU
+  run with `CUDA_VISIBLE_DEVICES=""`.
 - **Foreign load.** Processes you started by hand are measured and deducted from what the
   scheduler will hand out, so `ajs` does not admit a job onto cores something else is
   already using. `ajs status` shows it on its own line:
