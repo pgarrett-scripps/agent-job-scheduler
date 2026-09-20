@@ -104,7 +104,23 @@ class Config:
     cache writeback and dying processes stop perturbing the measurement."""
 
     contention_threshold: float = 2.0
-    """1-minute load average above which an exclusive run is stamped `contended`."""
+    """Foreign CPU cores (work not attributable to the job's own cgroup) above which an
+    exclusive run is stamped `contended`.
+
+    2.0 is deliberately tight. It only holds up because `track_external_load` stops an
+    exclusive job from starting on an already-busy machine; without that, ambient
+    desktop load alone exceeds it and every timing run gets flagged until the flag
+    means nothing."""
+
+    track_external_load: bool = True
+    """Count CPU and memory used by processes ajs did not start against free capacity.
+
+    Disable only if ajs is the sole workload on the machine; otherwise the scheduler
+    treats cores that a hand-launched process is already using as available."""
+
+    external_load_half_life_s: float = 15.0
+    """Smoothing for the foreign-CPU estimate. Short enough to notice a big process
+    starting, long enough that a one-second spike does not evict a queued job."""
 
     tick_seconds: float = 1.0
     """Scheduler loop period."""

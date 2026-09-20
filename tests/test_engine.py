@@ -23,6 +23,7 @@ def engine(tmp_path):
         default_max_runtime_s=30,
         max_jobs_per_project=4,
         use_systemd=False,  # plain process groups: faster and hermetic under pytest
+        track_external_load=False,  # otherwise the test host's own load decides the outcome
     )
     store = Store(tmp_path / "jobs.db")
     ex = Executor(cfg, tmp_path / "logs", use_systemd=False)
@@ -57,9 +58,7 @@ class TestExecution:
         assert result["exit_code"] == 3
 
     async def test_stdout_and_stderr_are_both_captured(self, engine):
-        job = engine.submit(
-            project="p", session_id="s", cmd=["/bin/sh", "-c", "echo out; echo err >&2"], cwd="/tmp"
-        )
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/sh", "-c", "echo out; echo err >&2"], cwd="/tmp")
         await drive(engine, job.id)
         logs = engine.log_tail(job.id)
         assert "out" in logs and "err" in logs
@@ -72,9 +71,7 @@ class TestExecution:
 
     async def test_granted_slots_are_exported_to_the_job(self, engine):
         """So a job can size its own thread pool to what it was granted, not to nproc."""
-        job = engine.submit(
-            project="p", session_id="s", cmd=["/bin/sh", "-c", "echo $AJS_CPU"], cwd="/tmp", cpu=3
-        )
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/sh", "-c", "echo $AJS_CPU"], cwd="/tmp", cpu=3)
         await drive(engine, job.id)
         assert engine.log_tail(job.id).strip() == "3"
 
@@ -88,9 +85,7 @@ class TestExecution:
 class TestCapacity:
     async def test_jobs_beyond_capacity_wait_their_turn(self, engine):
         ids = [
-            engine.submit(
-                project=f"p{i}", session_id="s", cmd=["/bin/sleep", "0.4"], cwd="/tmp", cpu=3
-            ).id
+            engine.submit(project=f"p{i}", session_id="s", cmd=["/bin/sleep", "0.4"], cwd="/tmp", cpu=3).id
             for i in range(3)
         ]
         await engine.tick()
@@ -160,9 +155,7 @@ class TestCancellation:
 
 class TestTimeout:
     async def test_job_exceeding_max_runtime_is_killed(self, engine):
-        job = engine.submit(
-            project="p", session_id="s", cmd=["/bin/sleep", "30"], cwd="/tmp", max_runtime_s=1
-        )
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/sleep", "30"], cwd="/tmp", max_runtime_s=1)
         result = await drive(engine, job.id, timeout=20)
         assert result["state"] == "timeout"
         assert "max_runtime" in (result["cancel_reason"] or "")

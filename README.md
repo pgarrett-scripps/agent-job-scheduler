@@ -117,6 +117,18 @@ ajs submit --cpu 8 -- sh -c 'cargo test --release -j $AJS_CPU'
   another agent's one job.
 - **Leases** (`acquire_lease`) for work that must run inside the agent's own process.
   Heartbeat-based, so a dead agent's hold is reclaimed rather than wedging the queue.
+- **Foreign load.** Processes you started by hand are measured and deducted from what the
+  scheduler will hand out, so `ajs` does not admit a job onto cores something else is
+  already using. `ajs status` shows it on its own line:
+
+  ```
+  cpu 0/20   mem 0/57851 MB   gpu 0/1   load 8.23
+  outside ajs 3 cpu, 25297 MB (deducted from what the scheduler will hand out)
+  ```
+
+  A job held up by this says so, and gets no start-time estimate — nothing tells the
+  scheduler when a process it did not start will exit. Set `track_external_load: false`
+  if ajs is the only thing that ever runs on the machine.
 
 ## Enforcement
 

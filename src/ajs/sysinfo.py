@@ -30,6 +30,22 @@ def total_mem_mb() -> int:
     return 4096
 
 
+def available_mem_mb() -> int | None:
+    """Memory the kernel thinks can be handed out without swapping.
+
+    MemAvailable rather than MemFree: page cache is reclaimable, and counting it as
+    used would make a machine that has merely read a large file look full.
+    """
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except OSError:  # pragma: no cover - non-Linux
+        pass
+    return None
+
+
 def gpu_count() -> int:
     """Number of NVIDIA GPUs, or 0 if nvidia-smi is unavailable."""
     if shutil.which("nvidia-smi") is None:

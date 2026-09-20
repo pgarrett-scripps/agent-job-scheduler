@@ -19,6 +19,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import sysinfo
+
 CGROUP_ROOT = Path("/sys/fs/cgroup")
 
 
@@ -73,6 +75,14 @@ def cgroup_cpu_seconds(path: Path) -> float | None:
     return None
 
 
+def cgroup_mem_bytes(path: Path) -> int | None:
+    """Current anonymous+page-cache memory charged to ``path``."""
+    try:
+        return int((path / "memory.current").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
 @dataclass(slots=True)
 class ContentionReport:
     """What else was happening while the job ran."""
@@ -113,6 +123,14 @@ class ContentionMonitor:
             self._cgroup = cgroup_path_for_pid(pid)
             if self._cgroup is not None:
                 self._cgroup_start = cgroup_cpu_seconds(self._cgroup)
+
+    def current_cpu_seconds(self) -> float | None:
+        """CPU seconds this job has used so far, or None if unaccounted."""
+        return cgroup_cpu_seconds(self._cgroup) if self._cgroup is not None else None
+
+    def current_mem_bytes(self) -> int | None:
+        """Memory this job is using right now, or None if unaccounted."""
+        return cgroup_mem_bytes(self._cgroup) if self._cgroup is not None else None
 
     def finish(self, now: float) -> ContentionReport:
         elapsed = max(now - self._t_start, 1e-6)
@@ -155,3 +173,84 @@ class ContentionMonitor:
             f"threshold {self.threshold:.2f})"
         )
         return ContentionReport(foreign, elapsed, cores, contended, note)
+
+
+class ExternalLoad:
+    """Tracks resources consumed by processes the scheduler did not start.
+
+    The scheduler's capacity arithmetic silently assumes ajs is the only thing on the
+    machine. It is not: a hand-run search, a browser, another agent's stray subprocess
+    all take cores that ajs still counts as free, so it happily admits a job onto a box
+    that is already saturated -- and an exclusive timing run gets contaminated by
+    exactly the load it was supposed to exclude.
+
+    This closes that gap by measuring what ajs cannot account for:
+
+        external_cpu = (system-wide busy delta) - (delta across ajs job cgroups)
+        external_mem = (total - MemAvailable) - (sum of ajs job cgroup memory)
+
+    The result is reported as *usage*, never as a smaller machine. That distinction
+    matters: shrinking capacity would make a 20-core exclusive job "impossible" the
+    moment a browser opened, whereas treating foreign work as usage merely makes it
+    wait for the machine to quieten.
+    """
+
+    def __init__(self, *, half_life_s: float = 15.0) -> None:
+        self.half_life = half_life_s
+        """CPU is smoothed because a raw one-second sample is spiky enough that a single
+        compile would evict a queued job. Memory is not smoothed -- it is a level, not a
+        rate, and reacting late to it risks an OOM."""
+        self.cpu_cores: float = 0.0
+        self.mem_mb: int = 0
+        self.ready = False
+        """False until two samples exist. Until then callers should fall back to a
+        conservative prior rather than trusting a 0."""
+        self._busy: float | None = None
+        self._own_cpu: float = 0.0
+        self._t: float | None = None
+
+    def sample(self, now: float, own_cpu_seconds: float, own_mem_mb: int) -> None:
+        """Fold one observation in. ``own_*`` are the totals across all ajs jobs."""
+        total = sysinfo.total_mem_mb()
+        available = sysinfo.available_mem_mb()
+        if available is not None:
+            self.mem_mb = max(0, (total - available) - own_mem_mb)
+
+        busy = system_busy_seconds()
+        if busy is None:  # pragma: no cover - non-Linux
+            return
+
+        if self._busy is None or self._t is None:
+            self._busy, self._own_cpu, self._t = busy, own_cpu_seconds, now
+            return
+
+        dt = now - self._t
+        if dt < 1e-3:
+            return
+
+        busy_delta = max(0.0, busy - self._busy)
+        # Counters only rise while a job lives; when one exits its cgroup total vanishes
+        # from the sum, so a negative delta means "a job ended", not "foreign work".
+        own_delta = max(0.0, own_cpu_seconds - self._own_cpu) if own_cpu_seconds >= self._own_cpu else 0.0
+        cores = max(0.0, (busy_delta - own_delta) / dt)
+
+        alpha = 1.0 - 0.5 ** (dt / self.half_life) if self.half_life > 0 else 1.0
+        self.cpu_cores = cores if not self.ready else self.cpu_cores + alpha * (cores - self.cpu_cores)
+
+        self._busy, self._own_cpu, self._t = busy, own_cpu_seconds, now
+        self.ready = True
+
+    def usage(self, cap_cpu: int) -> dict[str, int]:
+        """Foreign usage as whole units, for subtraction from free capacity.
+
+        Rounded *down* so that rounding never invents contention out of a fractional
+        core, and clamped to ``cap_cpu - 1`` so foreign load can throttle the queue but
+        can never wedge it completely.
+        """
+        if not self.ready:
+            # No differenced sample yet (daemon just started). Load average is a decent
+            # stand-in here precisely because ajs has not run anything to pollute it.
+            cores = sysinfo.load_average()[0]
+        else:
+            cores = self.cpu_cores
+        return {"cpu": min(max(0, int(cores)), max(0, cap_cpu - 1)), "mem_mb": self.mem_mb, "gpu": 0}

@@ -224,7 +224,5 @@ class TestFairness:
 
 class TestLeases:
     def test_lease_usage_reduces_availability(self, cap, cfg):
-        decision = run_plan(
-            [make_job(1, cpu=8)], cap=cap, cfg=cfg, lease_usage={"cpu": 16, "mem_mb": 0, "gpu": 0}
-        )
+        decision = run_plan([make_job(1, cpu=8)], cap=cap, cfg=cfg, lease_usage={"cpu": 16, "mem_mb": 0, "gpu": 0})
         assert decision.start == []

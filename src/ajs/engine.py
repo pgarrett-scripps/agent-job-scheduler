@@ -17,7 +17,7 @@ from typing import Any
 
 from . import sysinfo
 from .config import Config, db_path, log_dir
-from .contention import ContentionMonitor
+from .contention import ContentionMonitor, ExternalLoad
 from .db import Store
 from .executor import Executor, RunningProcess
 from .models import Job, JobClass, JobState, ResourceRequest
@@ -38,6 +38,7 @@ class Engine:
         self.monitors: dict[int, ContentionMonitor] = {}
         self.last_decision = Decision()
         self.last_finish_at: float = 0.0
+        self.external = ExternalLoad(half_life_s=cfg.external_load_half_life_s)
         self.paused = False
         self.draining = False
         self._waiters: dict[int, list[asyncio.Future[None]]] = {}
@@ -94,6 +95,7 @@ class Engine:
 
     async def tick(self) -> None:
         now = time.time()
+        self._sample_external(now)
 
         expired = self.store.expire_leases(now - self.cfg.lease_timeout_s)
         for lease_id in expired:
@@ -125,6 +127,7 @@ class Engine:
             now=now,
             last_start=self.store.project_last_start(),
             lease_usage=self._lease_usage(),
+            external_usage=self._external_usage(),
             free_disk_mb=sysinfo.free_disk_mb(self.cfg.disk_watch_path),
             last_finish_at=self.last_finish_at,
         )
@@ -137,6 +140,30 @@ class Engine:
 
         if decision.reservation is not None:
             self.store.update_job(decision.reservation.job_id, reserved_until=decision.reservation.start_at)
+
+    def _sample_external(self, now: float) -> None:
+        """Measure what is running on this machine that ajs did not start.
+
+        Summing the live job cgroups gives ajs's own share; whatever else the kernel
+        counts as busy belongs to somebody else.
+        """
+        if not self.cfg.track_external_load:
+            return
+        own_cpu = 0.0
+        own_mem = 0
+        for monitor in self.monitors.values():
+            cpu = monitor.current_cpu_seconds()
+            if cpu is not None:
+                own_cpu += cpu
+            mem = monitor.current_mem_bytes()
+            if mem is not None:
+                own_mem += mem // (1024 * 1024)
+        self.external.sample(now, own_cpu, own_mem)
+
+    def _external_usage(self) -> dict[str, int] | None:
+        if not self.cfg.track_external_load:
+            return None
+        return self.external.usage(self.cap.cpu)
 
     def _lease_usage(self) -> dict[str, int]:
         usage = {"cpu": 0, "mem_mb": 0, "gpu": 0}
@@ -360,10 +387,16 @@ class Engine:
         leases = self._lease_usage()
         for key in used:
             used[key] += leases[key]
+        external = self._external_usage() or {"cpu": 0, "mem_mb": 0, "gpu": 0}
+        cap = self.cap.as_dict()
         return {
-            "capacity": self.cap.as_dict(),
+            "capacity": cap,
             "used": used,
-            "free": {k: self.cap.as_dict()[k] - used[k] for k in used},
+            "external": external,
+            # Free is what the scheduler will actually hand out, so foreign load is
+            # subtracted here too -- reporting it as free is the very confusion this
+            # measurement exists to remove.
+            "free": {k: max(0, cap[k] - used[k] - external.get(k, 0)) for k in used},
             "running": [j.to_dict() for j in running],
             "queued": [{**j.to_dict(), "blocked_reason": self.blocked_reason(j.id)} for j in queued],
             "reservation": (
@@ -371,6 +404,7 @@ class Engine:
                     "job_id": self.last_decision.reservation.job_id,
                     "start_at": self.last_decision.reservation.start_at,
                     "in_seconds": self.last_decision.reservation.start_at - time.time(),
+                    "external": self.last_decision.reservation.external,
                 }
                 if self.last_decision.reservation
                 else None

@@ -273,6 +273,14 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
         f"[bold]gpu[/bold] {used['gpu']}/{cap['gpu']}   "
         f"[bold]load[/bold] {data['load'][0]:.2f}   {header}"
     )
+    ext = data.get("external") or {}
+    if ext.get("cpu") or ext.get("mem_mb"):
+        # Shown separately from `used` so it is obvious these cores are not ajs's doing
+        # and will not be freed by cancelling a job.
+        console.print(
+            f"[yellow]outside ajs[/yellow] {ext.get('cpu', 0)} cpu, {ext.get('mem_mb', 0)} MB "
+            f"[dim](deducted from what the scheduler will hand out)[/dim]"
+        )
     disk_colour = "red" if data["free_disk_mb"] < data["disk_floor_mb"] else "dim"
     console.print(
         f"[{disk_colour}]disk {data['free_disk_mb']} MB free (floor {data['disk_floor_mb']} MB)[/{disk_colour}]"
@@ -318,7 +326,12 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
 
     res = data.get("reservation")
     if res:
-        console.print(f"[cyan]reservation:[/cyan] job {res['job_id']} starts in ~{max(0, res['in_seconds']):.0f}s")
+        if res.get("external"):
+            # Announcing "~0s" here would be a promise the scheduler cannot keep: what
+            # blocks the job is load ajs does not control and cannot time.
+            console.print(f"[cyan]reservation:[/cyan] job {res['job_id']} waiting on load outside ajs (no ETA)")
+        else:
+            console.print(f"[cyan]reservation:[/cyan] job {res['job_id']} starts in ~{max(0, res['in_seconds']):.0f}s")
 
     if not data["running"] and not data["queued"]:
         console.print("[dim]idle[/dim]")

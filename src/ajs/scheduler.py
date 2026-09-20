@@ -45,6 +45,10 @@ class Reservation:
     job_id: int
     start_at: float
     needs: dict[str, int]
+    external: bool = False
+    """True when foreign load -- not ajs's own jobs -- is what blocks the job. Such a
+    reservation carries no honest start time (nothing tells us when a browser will
+    close), so it must not be used to veto backfill."""
 
 
 @dataclass(slots=True)
@@ -123,6 +127,7 @@ def plan(
     last_start: dict[str, float],
     held_locks: set[str] | None = None,
     lease_usage: dict[str, int] | None = None,
+    external_usage: dict[str, int] | None = None,
     free_disk_mb: int = 1 << 30,
     last_finish_at: float = 0.0,
 ) -> Decision:
@@ -131,15 +136,20 @@ def plan(
     ``last_finish_at`` is when the most recent job exited; it gates the settle period
     before an exclusive run, so writeback and dying processes are not still perturbing
     the machine when the measurement starts.
+
+    ``external_usage`` is resource consumed by processes ajs did not start. It is
+    subtracted from what is free but *not* from ``cap``, so a busy machine delays jobs
+    instead of declaring them impossible.
     """
     decision = Decision()
 
     free = cap.as_dict()
     for job in running:
         _deduct(free, effective_request(job, cap))
-    for key, amount in (lease_usage or {}).items():
-        if key in free:
-            free[key] -= amount
+    for usage in (lease_usage, external_usage):
+        for key, amount in (usage or {}).items():
+            if key in free:
+                free[key] -= amount
 
     locks: set[str] = set(held_locks or set())
     for job in running:
@@ -181,17 +191,21 @@ def plan(
 
         # --- availability --------------------------------------------------
         if not _fits(need, free):
+            outside = _external_note(external_usage)
             if reservation is None:
-                reservation = _reserve(job, need, running, cap, now)
+                reservation = _reserve(job, need, running, cap, now, external_usage)
                 decision.reservation = reservation
                 decision.blocked[job.id] = (
-                    f"waiting for resources; reserved to start by {reservation.start_at - now:.0f}s from now"
+                    f"waiting for load outside ajs to drop{outside}; no reservation possible"
+                    if reservation.external
+                    else f"waiting for resources{outside}; "
+                    f"reserved to start by {reservation.start_at - now:.0f}s from now"
                 )
             else:
-                decision.blocked[job.id] = "waiting for resources"
+                decision.blocked[job.id] = f"waiting for resources{outside}"
             continue
 
-        if reservation is not None:
+        if reservation is not None and not reservation.external:
             # A starved job holds a reservation. Only let this one jump the queue if it
             # provably finishes before that promised start time (conservative EASY
             # backfill) -- otherwise it would push the reservation back indefinitely.
@@ -224,14 +238,42 @@ def plan(
     return decision
 
 
-def _reserve(job: Job, need: dict[str, int], running: list[Job], cap: Capacity, now: float) -> Reservation:
+def _external_note(external_usage: dict[str, int] | None) -> str:
+    """Name foreign load in a blocked message, so `waiting for resources` on an
+    apparently idle queue is explicable rather than mysterious."""
+    if not external_usage:
+        return ""
+    parts = []
+    if external_usage.get("cpu"):
+        parts.append(f"{external_usage['cpu']} cpu")
+    if external_usage.get("mem_mb"):
+        parts.append(f"{external_usage['mem_mb']} MB")
+    return f" ({', '.join(parts)} in use outside ajs)" if parts else ""
+
+
+def _reserve(
+    job: Job,
+    need: dict[str, int],
+    running: list[Job],
+    cap: Capacity,
+    now: float,
+    external_usage: dict[str, int] | None = None,
+) -> Reservation:
     """Earliest time ``job`` can start, assuming running jobs last their full max_runtime.
 
     Walks the running set in projected-completion order, accumulating freed resources
     until the job fits. Pessimistic by construction: jobs usually finish early, so the
     real start is typically sooner than promised.
+
+    Foreign load is held constant throughout, since nothing declares when it will end.
+    If the job still does not fit once every ajs job has drained, foreign load is the
+    binding constraint and the returned reservation is marked ``external``.
     """
     free = cap.as_dict()
+    for key, amount in (external_usage or {}).items():
+        if key in free:
+            free[key] -= amount
+    drained = dict(free)
     for other in running:
         _deduct(free, effective_request(other, cap))
 
@@ -243,6 +285,8 @@ def _reserve(job: Job, need: dict[str, int], running: list[Job], cap: Capacity, 
         if _fits(need, free):
             return Reservation(job_id=job.id, start_at=_projected_end(other, now), needs=need)
 
-    # Nothing running frees enough; it will fit once the machine drains completely.
+    # Nothing running frees enough. Either the machine is simply full of ajs work, or
+    # foreign load alone already exceeds what the job needs -- distinguishable by asking
+    # whether it would fit on a fully drained scheduler.
     latest = max((_projected_end(j, now) for j in running), default=now)
-    return Reservation(job_id=job.id, start_at=latest, needs=need)
+    return Reservation(job_id=job.id, start_at=latest, needs=need, external=not _fits(need, drained))

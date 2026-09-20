@@ -109,6 +109,41 @@ class: batch              # interactive | batch | background
 Acquisition of all resources for a job happens in **one SQLite transaction**. A job either gets
 everything or waits — no partial holds, so no deadlock between two half-satisfied jobs.
 
+## Foreign load
+
+The capacity table above describes the machine, not the scheduler's share of it. Anything
+launched outside ajs — a hand-run search, a browser, another agent shelling out directly —
+takes cores that ajs would otherwise count as free. Left uncorrected the scheduler admits
+jobs onto a saturated box, and an exclusive timing run is contaminated by precisely the
+load it was meant to exclude.
+
+So every tick measures what it cannot account for:
+
+```
+external_cpu = (system-wide busy delta) − (delta summed over ajs job cgroups)
+external_mem = (MemTotal − MemAvailable) − (sum of ajs job cgroup memory)
+```
+
+This is the same subtraction the contention monitor performs per job, applied continuously
+to the whole machine. Two properties are deliberate:
+
+- **It is reported as usage, never as reduced capacity.** Shrinking `cap` would make a
+  20-core exclusive job *impossible* the moment a browser opened. Treating foreign work as
+  usage makes it wait instead.
+- **A job blocked only by foreign load gets no reservation promise.** Reservations bound a
+  wait by projecting running jobs' `max_runtime`; nothing declares when a browser closes.
+  Such a reservation is flagged `external` and does not veto backfill — holding cores empty
+  for a start time we cannot predict would strand small jobs for nothing.
+
+CPU is smoothed (15 s half-life) because a one-second sample is spiky enough that a single
+compile would evict a queued job. Memory is not: it is a level rather than a rate, and
+reacting late to it risks an OOM. Foreign CPU is floored to whole cores and capped at
+`cap.cpu − 1`, so a pathological reading throttles the queue but can never wedge it.
+
+This is also what makes `contention_threshold: 2.0` defensible. Ambient desktop load on
+this machine alone exceeds two cores, so without the admission guard every timing run
+would be stamped `contended` until the flag stopped meaning anything.
+
 ## Timing runs
 
 A timing run is **not a mode**. It is:
