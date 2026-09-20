@@ -65,6 +65,62 @@ def gpu_count() -> int:
     return len([ln for ln in out.stdout.splitlines() if ln.strip()])
 
 
+def _nvidia_smi(query: str, *, gpu: bool) -> list[str] | None:
+    """Run one nvidia-smi CSV query, or None if the tool is missing or fails."""
+    if shutil.which("nvidia-smi") is None:
+        return None
+    flag = "--query-gpu" if gpu else "--query-compute-apps"
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", f"{flag}={query}", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover
+        return None
+    if out.returncode != 0:
+        return None
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+
+
+def gpu_total_mem_mb() -> int:
+    """Total VRAM across all GPUs, in MB."""
+    rows = _nvidia_smi("memory.total", gpu=True)
+    if not rows:
+        return 0
+    total = 0
+    for row in rows:
+        try:
+            total += int(float(row))
+        except ValueError:  # pragma: no cover
+            continue
+    return total
+
+
+def gpu_compute_apps() -> dict[int, int] | None:
+    """PID -> VRAM MB for every process currently holding GPU memory.
+
+    None means we could not ask (no nvidia-smi, or it failed), which is different from
+    an empty dict: callers must not read "unknown" as "nothing is on the GPU".
+    """
+    rows = _nvidia_smi("pid,used_gpu_memory", gpu=False)
+    if rows is None:
+        return None
+    apps: dict[int, int] = {}
+    for row in rows:
+        parts = [p.strip() for p in row.split(",")]
+        if len(parts) < 2:
+            continue
+        try:
+            apps[int(parts[0])] = int(float(parts[1]))
+        except ValueError:
+            # "[N/A]" shows up for processes in other containers or MIG instances.
+            continue
+    return apps
+
+
 def load_average() -> tuple[float, float, float]:
     """1/5/15-minute load average."""
     try:

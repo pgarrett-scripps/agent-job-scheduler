@@ -93,6 +93,14 @@ def submit(
     cpu: Annotated[int, typer.Option("--cpu", "-c", help="CPU slots required.")] = 1,
     mem: Annotated[str, typer.Option("--mem", "-m", help="Memory, e.g. 8G or 512M.")] = "512M",
     gpu: Annotated[int, typer.Option("--gpu", help="GPUs required.")] = 0,
+    gpu_mem: Annotated[
+        str,
+        typer.Option("--gpu-mem", help="VRAM required, e.g. 2G. Defaults to the whole card when --gpu is set."),
+    ] = "0M",
+    gpu_exclusive: Annotated[
+        bool,
+        typer.Option("--gpu-exclusive", "-X", help="GPU timing run: take the whole card. Independent of -x."),
+    ] = False,
     disk: Annotated[str, typer.Option("--disk", help="Disk this job will write, e.g. 20G.")] = "0M",
     exclusive: Annotated[
         bool,
@@ -126,8 +134,10 @@ def submit(
             cpu=cpu,
             mem_mb=parse_mem(mem),
             gpu=gpu,
+            gpu_mem_mb=parse_mem(gpu_mem),
             disk_mb=parse_mem(disk),
             exclusive=exclusive,
+            gpu_exclusive=gpu_exclusive,
             locks=list(lock or []),
             max_runtime_s=parse_duration(max_runtime),
             job_class=job_class,
@@ -270,10 +280,13 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
     console.print(
         f"[bold]cpu[/bold] {used['cpu']}/{cap['cpu']}   "
         f"[bold]mem[/bold] {used['mem_mb']}/{cap['mem_mb']} MB   "
-        f"[bold]gpu[/bold] {used['gpu']}/{cap['gpu']}   "
+        f"[bold]gpu[/bold] {used['gpu']}/{cap['gpu']} "
+        f"({used.get('gpu_mem_mb', 0)}/{cap.get('gpu_mem_mb', 0)} MB)   "
         f"[bold]load[/bold] {data['load'][0]:.2f}   {header}"
     )
     ext = data.get("external") or {}
+    if ext.get("gpu_mem_mb"):
+        console.print(f"[yellow]outside ajs[/yellow] {ext['gpu_mem_mb']} MB VRAM held by non-ajs processes")
     if ext.get("cpu") or ext.get("mem_mb"):
         # Shown separately from `used` so it is obvious these cores are not ajs's doing
         # and will not be freed by cancelling a job.
@@ -315,7 +328,13 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
         table.add_column("needs")
         table.add_column("waiting on", overflow="fold")
         for job in data["queued"]:
-            needs = f"{job['cpu']}cpu/{job['mem_mb']}M" + ("/exclusive" if job["exclusive"] else "")
+            needs = f"{job['cpu']}cpu/{job['mem_mb']}M"
+            if job.get("gpu_mem_mb"):
+                needs += f"/{job['gpu_mem_mb']}M vram"
+            if job["exclusive"]:
+                needs += "/exclusive"
+            if job.get("gpu_exclusive"):
+                needs += "/gpu-exclusive"
             table.add_row(
                 str(job["id"]),
                 job["project"],

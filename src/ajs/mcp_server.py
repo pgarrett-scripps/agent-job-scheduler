@@ -37,6 +37,12 @@ the scheduler drain the machine, wait for it to go quiet, and run your job alone
 report whether anything else interfered. A timing run without it is unreliable and the
 number should not be trusted.
 
+For GPU work, pass gpu=1 and declare `gpu_mem`. The card has 4 GB total, so a job that
+does not say how much VRAM it needs is charged for the whole thing and will serialise
+against every other GPU job. GPU timing runs use gpu_exclusive=true, which is a separate
+switch from `exclusive`: a CPU benchmark does not need the card idle, and a GPU benchmark
+does not need all 20 cores. Set both only if the job genuinely needs both.
+
 Always declare `cpu` and `mem` honestly. The scheduler hands out slots based on what you
 claim, so under-declaring causes the overloading this exists to prevent.
 """
@@ -66,8 +72,10 @@ def build_server() -> Any:
         cpu: int = 1,
         mem: str = "512M",
         gpu: int = 0,
+        gpu_mem: str = "0M",
         disk: str = "0M",
         exclusive: bool = False,
+        gpu_exclusive: bool = False,
         locks: list[str] | None = None,
         max_runtime: str = "1h",
         job_class: str = "batch",
@@ -84,12 +92,17 @@ def build_server() -> Any:
             cwd: working directory. Defaults to where the daemon was started, so pass it.
             cpu: CPU slots to reserve. Declare honestly -- the scheduler trusts this.
             mem: memory reservation, e.g. "8G". The job is killed if it exceeds this.
-            gpu: GPUs needed (this machine has few, so GPU jobs serialise).
+            gpu: set to 1 for any job that touches CUDA. Jobs that leave this at 0 get
+                CUDA_VISIBLE_DEVICES="" and cannot see the card at all.
+            gpu_mem: VRAM to reserve, e.g. "2G". The card has 4 GB. Omitting this on a
+                GPU job reserves the whole card, which is safe but serialises.
             disk: how much disk the job will write, e.g. "20G". Checked against the
                 free-space floor before admission.
-            exclusive: TIMING RUNS ONLY. Takes the entire machine, waits for it to settle,
-                and records whether anything else interfered. Required for any benchmark
-                whose number you intend to report.
+            exclusive: CPU TIMING RUNS ONLY. Takes every core, waits for the machine to
+                settle, and records whether anything else interfered. Required for any
+                benchmark whose number you intend to report.
+            gpu_exclusive: GPU TIMING RUNS ONLY. Takes the whole card. Independent of
+                `exclusive` -- set both only if the measurement depends on both.
             locks: named locks for logical conflicts, e.g. ["sage-index"]. Two jobs
                 naming the same lock never run together.
             max_runtime: hard ceiling, e.g. "30m". The job is killed past it. Keep it
@@ -108,8 +121,10 @@ def build_server() -> Any:
                 cpu=cpu,
                 mem_mb=parse_mem(mem),
                 gpu=gpu,
+                gpu_mem_mb=parse_mem(gpu_mem),
                 disk_mb=parse_mem(disk),
                 exclusive=exclusive,
+                gpu_exclusive=gpu_exclusive,
                 locks=list(locks or []),
                 max_runtime_s=parse_duration(max_runtime),
                 job_class=job_class,
@@ -142,7 +157,10 @@ def build_server() -> Any:
         cwd: str | None = None,
         cpu: int = 1,
         mem: str = "512M",
+        gpu: int = 0,
+        gpu_mem: str = "0M",
         exclusive: bool = False,
+        gpu_exclusive: bool = False,
         max_runtime: str = "1h",
         timeout_seconds: int = 600,
         project: str | None = None,
@@ -158,7 +176,10 @@ def build_server() -> Any:
             cwd=cwd,
             cpu=cpu,
             mem=mem,
+            gpu=gpu,
+            gpu_mem=gpu_mem,
             exclusive=exclusive,
+            gpu_exclusive=gpu_exclusive,
             max_runtime=max_runtime,
             job_class="interactive",
             project=project,
@@ -244,6 +265,8 @@ def _summarise(job: dict[str, Any]) -> dict[str, Any]:
         "exit_code",
         "runtime_s",
         "exclusive",
+        "gpu_exclusive",
+        "gpu_mem_mb",
         "contended",
         "contention_note",
         "blocked_reason",

@@ -15,7 +15,7 @@ NOW = 1_000_000.0
 
 @pytest.fixture
 def cap():
-    return Capacity(cpu=20, mem_mb=56000, gpu=1)
+    return Capacity(cpu=20, mem_mb=56000, gpu=1, gpu_mem_mb=3584)
 
 
 @pytest.fixture
@@ -24,6 +24,7 @@ def cfg():
         cpu=20,
         mem_mb=56000,
         gpu=1,
+        gpu_mem_mb=3584,
         disk_floor_mb=20480,
         settle_seconds=10.0,
         max_jobs_per_project=4,
@@ -38,8 +39,10 @@ def make_job(
     cpu: int = 1,
     mem_mb: int = 512,
     gpu: int = 0,
+    gpu_mem_mb: int = 0,
     disk_mb: int = 0,
     exclusive: bool = False,
+    gpu_exclusive: bool = False,
     locks: list[str] | None = None,
     max_runtime_s: int = 3600,
     job_class: JobClass = JobClass.BATCH,
@@ -55,7 +58,14 @@ def make_job(
         cwd="/tmp",
         env={},
         resources=ResourceRequest(
-            cpu=cpu, mem_mb=mem_mb, gpu=gpu, disk_mb=disk_mb, exclusive=exclusive, locks=list(locks or [])
+            cpu=cpu,
+            mem_mb=mem_mb,
+            gpu=gpu,
+            gpu_mem_mb=gpu_mem_mb,
+            disk_mb=disk_mb,
+            exclusive=exclusive,
+            gpu_exclusive=gpu_exclusive,
+            locks=list(locks or []),
         ),
         max_runtime_s=max_runtime_s,
         job_class=job_class,

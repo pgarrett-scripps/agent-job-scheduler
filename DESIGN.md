@@ -90,7 +90,8 @@ Everything is a **counted semaphore**. Nothing is special-cased.
 |---|---|---|
 | `cpu` | 20 | slots, declared per job |
 | `mem_mb` | ~56000 | leaves headroom for the desktop |
-| `gpu` | 1 | 4 GB — effectively exclusive |
+| `gpu` | 1 | RTX 3050 Ti Laptop; a predicate, not really a count — see below |
+| `gpu_mem_mb` | ~3584 | 4 GB card less a display reserve. **The GPU resource that actually runs out.** |
 | `disk_mb` | dynamic | **guard**: refuse to start if free space would drop below a floor |
 | named locks | 1 each | e.g. `lock:sage-index`, `lock:scratch-dir` — for logical conflicts, not hardware |
 | custom semaphores | configurable | e.g. `api:anthropic=3` to cap concurrent API-hammering jobs |
@@ -109,6 +110,22 @@ class: batch              # interactive | batch | background
 Acquisition of all resources for a job happens in **one SQLite transaction**. A job either gets
 everything or waits — no partial holds, so no deadlock between two half-satisfied jobs.
 
+## GPU as its own axis
+
+The GPU is scheduled on VRAM, not on device count. `gpu: 1` on a one-card machine as a
+counted semaphore means the card can never be shared — which makes declaring how much
+memory you need pointless. So a job that names a VRAM slice is gated by VRAM alone and
+does not consume the device; a job that asks for the GPU *without* naming a figure is
+charged the whole card, because two jobs each silently assuming 4 GB will OOM each other.
+
+`exclusive` and `gpu_exclusive` are **separate switches**. A 20-core CPU benchmark does
+not need the card idle, and a model that owns all 4 GB of VRAM barely touches the CPU.
+Coupling them would idle one resource during every measurement of the other, which on a
+single-GPU laptop is most of the time. A job that genuinely needs both sets both.
+
+Jobs that did not ask for the GPU are started with `CUDA_VISIBLE_DEVICES=""`. Without
+that, the VRAM arithmetic is a polite fiction — anything could grab the card.
+
 ## Foreign load
 
 The capacity table above describes the machine, not the scheduler's share of it. Anything
@@ -120,8 +137,9 @@ load it was meant to exclude.
 So every tick measures what it cannot account for:
 
 ```
-external_cpu = (system-wide busy delta) − (delta summed over ajs job cgroups)
-external_mem = (MemTotal − MemAvailable) − (sum of ajs job cgroup memory)
+external_cpu  = (system-wide busy delta) − (delta summed over ajs job cgroups)
+external_mem  = (MemTotal − MemAvailable) − (sum of ajs job cgroup memory)
+external_vram = nvidia-smi compute apps whose cgroup is not an ajs job scope
 ```
 
 This is the same subtraction the contention monitor performs per job, applied continuously
@@ -260,6 +278,5 @@ see below.
 
 - **Declared vs. measured resources.** Agents will guess `cpu: 8` badly. Phase 3's cgroup accounting
   gives you actuals — worth feeding back as a per-command default learned from history?
-- **GPU at 4 GB.** Probably always `gpu: 1` exclusive. Revisit if you ever run two small models.
 - **Cross-machine.** Design is single-node throughout. If a second box ever appears, the socket
   becomes TCP and `resources` grows a `node` column — but don't build for it now.

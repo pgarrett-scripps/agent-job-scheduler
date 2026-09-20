@@ -86,6 +86,14 @@ class Config:
     gpu: int = 0
     """Schedulable GPUs. 0 means autodetect."""
 
+    gpu_mem_mb: int = 0
+    """Schedulable VRAM. 0 means autodetect (total minus gpu_mem_reserve_mb)."""
+
+    gpu_mem_reserve_mb: int = 512
+    """Held back from scheduling for the display. On a laptop GPU the compositor and
+    browser share the card with compute, and a job that takes literally all of it will
+    either fail to allocate or stall the desktop."""
+
     mem_reserve_mb: int = 6144
     """Held back from scheduling so the desktop does not swap while jobs run."""
 
@@ -148,7 +156,9 @@ class Config:
         cpu = self.cpu or sysinfo.cpu_count()
         mem = self.mem_mb or max(1024, sysinfo.total_mem_mb() - self.mem_reserve_mb)
         gpu = self.gpu if self.gpu else sysinfo.gpu_count()
-        return replace(self, cpu=cpu, mem_mb=mem, gpu=gpu)
+        total_vram = sysinfo.gpu_total_mem_mb()
+        gpu_mem = self.gpu_mem_mb or max(0, total_vram - self.gpu_mem_reserve_mb)
+        return replace(self, cpu=cpu, mem_mb=mem, gpu=gpu, gpu_mem_mb=gpu_mem)
 
     @classmethod
     def load(cls) -> Config:

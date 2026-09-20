@@ -86,7 +86,13 @@ class Executor:
         env["AJS_JOB_ID"] = str(job.id)
         env["AJS_CPU"] = str(need["cpu"])
         env["AJS_MEM_MB"] = str(need["mem_mb"])
+        env["AJS_GPU_MEM_MB"] = str(need.get("gpu_mem_mb", 0))
         env["AJS_EXCLUSIVE"] = "1" if job.resources.exclusive else "0"
+        env["AJS_GPU_EXCLUSIVE"] = "1" if job.resources.gpu_exclusive else "0"
+        if not (job.resources.gpu or job.resources.gpu_exclusive):
+            # A job that did not ask for the GPU must not be able to take it by accident;
+            # the scheduler's VRAM arithmetic is only true if this holds.
+            env["CUDA_VISIBLE_DEVICES"] = ""
 
         cwd = job.cwd if Path(job.cwd).is_dir() else str(Path.home())
 

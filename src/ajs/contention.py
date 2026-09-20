@@ -124,6 +124,11 @@ class ContentionMonitor:
             if self._cgroup is not None:
                 self._cgroup_start = cgroup_cpu_seconds(self._cgroup)
 
+    @property
+    def cgroup(self) -> Path | None:
+        """The job's cgroup, used to tell its GPU processes apart from everyone else's."""
+        return self._cgroup
+
     def current_cpu_seconds(self) -> float | None:
         """CPU seconds this job has used so far, or None if unaccounted."""
         return cgroup_cpu_seconds(self._cgroup) if self._cgroup is not None else None
@@ -197,6 +202,12 @@ class ExternalLoad:
 
     def __init__(self, *, half_life_s: float = 15.0) -> None:
         self.half_life = half_life_s
+        self.gpu_mem_mb: int = 0
+        """VRAM held by compute processes outside ajs. Not smoothed and not inferred:
+        nvidia-smi reports it directly per PID, so there is nothing to estimate."""
+        self.gpu_known = False
+        """False when nvidia-smi could not be queried. `unknown` must not be read as
+        `idle` -- that is the mistake this whole class exists to prevent."""
         """CPU is smoothed because a raw one-second sample is spiky enough that a single
         compile would evict a queued job. Memory is not smoothed -- it is a level, not a
         rate, and reacting late to it risks an OOM."""
@@ -209,8 +220,19 @@ class ExternalLoad:
         self._own_cpu: float = 0.0
         self._t: float | None = None
 
-    def sample(self, now: float, own_cpu_seconds: float, own_mem_mb: int) -> None:
-        """Fold one observation in. ``own_*`` are the totals across all ajs jobs."""
+    def sample(
+        self,
+        now: float,
+        own_cpu_seconds: float,
+        own_mem_mb: int,
+        own_cgroups: set[Path] | None = None,
+    ) -> None:
+        """Fold one observation in. ``own_*`` are the totals across all ajs jobs.
+
+        ``own_cgroups`` is how GPU processes get attributed: nvidia-smi reports PIDs, and
+        a PID belongs to ajs exactly when its cgroup is one of the job scopes.
+        """
+        self._sample_gpu(own_cgroups or set())
         total = sysinfo.total_mem_mb()
         available = sysinfo.available_mem_mb()
         if available is not None:
@@ -240,6 +262,22 @@ class ExternalLoad:
         self._busy, self._own_cpu, self._t = busy, own_cpu_seconds, now
         self.ready = True
 
+    def _sample_gpu(self, own_cgroups: set[Path]) -> None:
+        apps = sysinfo.gpu_compute_apps()
+        if apps is None:
+            self.gpu_known = False
+            return
+        self.gpu_known = True
+        foreign = 0
+        for pid, mem_mb in apps.items():
+            cgroup = cgroup_path_for_pid(pid)
+            if cgroup is not None and cgroup in own_cgroups:
+                continue
+            # A PID whose cgroup we cannot read is not ours to begin with (ajs job
+            # cgroups are always readable by the daemon), so count it as foreign.
+            foreign += mem_mb
+        self.gpu_mem_mb = foreign
+
     def usage(self, cap_cpu: int) -> dict[str, int]:
         """Foreign usage as whole units, for subtraction from free capacity.
 
@@ -253,4 +291,12 @@ class ExternalLoad:
             cores = sysinfo.load_average()[0]
         else:
             cores = self.cpu_cores
-        return {"cpu": min(max(0, int(cores)), max(0, cap_cpu - 1)), "mem_mb": self.mem_mb, "gpu": 0}
+        return {
+            "cpu": min(max(0, int(cores)), max(0, cap_cpu - 1)),
+            "mem_mb": self.mem_mb,
+            "gpu": 0,
+            # Deliberately charged as VRAM rather than as a whole GPU: a 300 MB browser
+            # compositor should shrink what a job may allocate, not make the card look
+            # fully taken.
+            "gpu_mem_mb": self.gpu_mem_mb,
+        }

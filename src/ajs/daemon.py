@@ -148,9 +148,15 @@ class Server:
         cpu: int = 1,
         mem_mb: int = 512,
         gpu: int = 0,
+        gpu_mem_mb: int = 0,
         reason: str = "",
     ) -> str | None:
-        return self.engine.acquire_lease(project, session_id, ResourceRequest(cpu=cpu, mem_mb=mem_mb, gpu=gpu), reason)
+        return self.engine.acquire_lease(
+            project,
+            session_id,
+            ResourceRequest(cpu=cpu, mem_mb=mem_mb, gpu=gpu, gpu_mem_mb=gpu_mem_mb),
+            reason,
+        )
 
     def do_heartbeat_lease(self, lease_id: str) -> bool:
         return self.engine.store.heartbeat_lease(lease_id)
@@ -194,10 +200,11 @@ async def serve(cfg: Config) -> None:
     os.chmod(path, 0o600)
     log.info("listening on %s", path)
     log.info(
-        "capacity: cpu=%s mem=%sMB gpu=%s | disk floor %sMB | settle %ss",
+        "capacity: cpu=%s mem=%sMB gpu=%s vram=%sMB | disk floor %sMB | settle %ss",
         cfg.cpu,
         cfg.mem_mb,
         cfg.gpu,
+        cfg.gpu_mem_mb,
         cfg.disk_floor_mb,
         cfg.settle_seconds,
     )

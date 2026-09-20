@@ -13,7 +13,7 @@ from .config import Config
 from .models import Job, ResourceRequest
 
 # Resource keys tracked as counted semaphores.
-_COUNTED = ("cpu", "mem_mb", "gpu")
+_COUNTED = ("cpu", "mem_mb", "gpu", "gpu_mem_mb")
 
 
 @dataclass(slots=True)
@@ -23,13 +23,14 @@ class Capacity:
     cpu: int
     mem_mb: int
     gpu: int
+    gpu_mem_mb: int = 0
 
     @classmethod
     def from_config(cls, cfg: Config) -> Capacity:
-        return cls(cpu=cfg.cpu, mem_mb=cfg.mem_mb, gpu=cfg.gpu)
+        return cls(cpu=cfg.cpu, mem_mb=cfg.mem_mb, gpu=cfg.gpu, gpu_mem_mb=cfg.gpu_mem_mb)
 
     def as_dict(self) -> dict[str, int]:
-        return {"cpu": self.cpu, "mem_mb": self.mem_mb, "gpu": self.gpu}
+        return {"cpu": self.cpu, "mem_mb": self.mem_mb, "gpu": self.gpu, "gpu_mem_mb": self.gpu_mem_mb}
 
 
 @dataclass(slots=True)
@@ -67,14 +68,39 @@ def effective_request(job: Job, cap: Capacity) -> dict[str, int]:
     This is where `exclusive` stops being a special case: it expands into a request for
     every CPU slot on the machine, after which the ordinary counted semaphores guarantee
     nothing else can be running. There is no separate drain mechanism.
+
+    ``gpu_exclusive`` does the same for the GPU, on a **separate axis**. A CPU benchmark
+    holding all 20 cores does not need the card idle, and a model that owns all 4 GB of
+    VRAM barely touches the CPU -- coupling them would idle one resource whenever the
+    other was being measured, which on a single-GPU laptop is most of the time.
     """
     r: ResourceRequest = job.resources
-    if r.exclusive:
-        return {"cpu": cap.cpu, "mem_mb": cap.mem_mb, "gpu": r.gpu}
     # Deliberately *not* clamped to capacity. Clamping would turn a mis-declared
     # `--cpu 999` into a silent grant of the whole machine; leaving it oversized lets
     # plan() reject it as impossible and tell the submitter what they got wrong.
-    return {"cpu": max(1, r.cpu), "mem_mb": max(0, r.mem_mb), "gpu": max(0, r.gpu)}
+    need = {
+        "cpu": cap.cpu if r.exclusive else max(1, r.cpu),
+        "mem_mb": cap.mem_mb if r.exclusive else max(0, r.mem_mb),
+        "gpu": max(0, r.gpu),
+        "gpu_mem_mb": max(0, r.gpu_mem_mb),
+    }
+    if r.gpu_exclusive:
+        need["gpu"] = max(cap.gpu, need["gpu"])
+        need["gpu_mem_mb"] = cap.gpu_mem_mb
+    elif need["gpu"]:
+        if not need["gpu_mem_mb"]:
+            # `--gpu 1` with no VRAM figure is the common case and the dangerous one: two
+            # such jobs would each assume the whole card and OOM each other. Charge them
+            # the whole device unless they say otherwise.
+            need["gpu_mem_mb"] = cap.gpu_mem_mb
+        else:
+            # A job that named a VRAM slice is gated by VRAM, not by device count.
+            # Keeping the device as a counted semaphore here would cap a single-GPU
+            # machine at one GPU job no matter how little memory each wanted, which is
+            # precisely the sharing that declaring `gpu_mem` is supposed to buy. The
+            # device is still checked for existence below, via the VRAM capacity.
+            need["gpu"] = 0
+    return need
 
 
 def _locks_of(job: Job) -> set[str]:

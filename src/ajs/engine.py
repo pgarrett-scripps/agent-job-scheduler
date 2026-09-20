@@ -151,6 +151,7 @@ class Engine:
             return
         own_cpu = 0.0
         own_mem = 0
+        own_cgroups = set()
         for monitor in self.monitors.values():
             cpu = monitor.current_cpu_seconds()
             if cpu is not None:
@@ -158,7 +159,9 @@ class Engine:
             mem = monitor.current_mem_bytes()
             if mem is not None:
                 own_mem += mem // (1024 * 1024)
-        self.external.sample(now, own_cpu, own_mem)
+            if monitor.cgroup is not None:
+                own_cgroups.add(monitor.cgroup)
+        self.external.sample(now, own_cpu, own_mem, own_cgroups)
 
     def _external_usage(self) -> dict[str, int] | None:
         if not self.cfg.track_external_load:
@@ -166,12 +169,13 @@ class Engine:
         return self.external.usage(self.cap.cpu)
 
     def _lease_usage(self) -> dict[str, int]:
-        usage = {"cpu": 0, "mem_mb": 0, "gpu": 0}
+        usage = {"cpu": 0, "mem_mb": 0, "gpu": 0, "gpu_mem_mb": 0}
         for row in self.store.active_leases():
             req = ResourceRequest.from_json(row["resources"])
             usage["cpu"] += req.cpu
             usage["mem_mb"] += req.mem_mb
             usage["gpu"] += req.gpu
+            usage["gpu_mem_mb"] += req.gpu_mem_mb
         return usage
 
     async def _enforce_runtime_limits(self, now: float) -> None:
@@ -219,7 +223,10 @@ class Engine:
             self._notify(job.id)
             return
 
-        monitor = ContentionMonitor(self.cfg.contention_threshold, assess=job.resources.exclusive)
+        monitor = ContentionMonitor(
+            self.cfg.contention_threshold,
+            assess=job.resources.exclusive or job.resources.gpu_exclusive,
+        )
         monitor.start(rp.proc.pid, now)
         self.monitors[job.id] = monitor
         self.running[job.id] = rp
@@ -275,7 +282,7 @@ class Engine:
             report = monitor.finish(now)
             fields["contended"] = 1 if report.contended else 0
             fields["contention_note"] = report.note
-            if report.contended and job is not None and job.resources.exclusive:
+            if report.contended and job is not None and (job.resources.exclusive or job.resources.gpu_exclusive):
                 log.warning("job %s ran CONTENDED: %s", job_id, report.note)
 
         if job is not None and job.cancel_reason and "max_runtime" in job.cancel_reason:
@@ -303,8 +310,10 @@ class Engine:
         cpu: int = 1,
         mem_mb: int = 512,
         gpu: int = 0,
+        gpu_mem_mb: int = 0,
         disk_mb: int = 0,
         exclusive: bool = False,
+        gpu_exclusive: bool = False,
         locks: list[str] | None = None,
         max_runtime_s: int | None = None,
         job_class: str = "batch",
@@ -313,8 +322,10 @@ class Engine:
             cpu=cpu,
             mem_mb=mem_mb,
             gpu=gpu,
+            gpu_mem_mb=gpu_mem_mb,
             disk_mb=disk_mb,
             exclusive=exclusive,
+            gpu_exclusive=gpu_exclusive,
             locks=list(locks or []),
         )
         job = self.store.add_job(
@@ -379,7 +390,7 @@ class Engine:
     def status(self) -> dict[str, Any]:
         running = self.store.jobs_in_state(JobState.RUNNING)
         queued = self.store.jobs_in_state(JobState.QUEUED)
-        used = {"cpu": 0, "mem_mb": 0, "gpu": 0}
+        used = {"cpu": 0, "mem_mb": 0, "gpu": 0, "gpu_mem_mb": 0}
         for job in running:
             need = effective_request(job, self.cap)
             for key in used:
@@ -387,7 +398,7 @@ class Engine:
         leases = self._lease_usage()
         for key in used:
             used[key] += leases[key]
-        external = self._external_usage() or {"cpu": 0, "mem_mb": 0, "gpu": 0}
+        external = self._external_usage() or {"cpu": 0, "mem_mb": 0, "gpu": 0, "gpu_mem_mb": 0}
         cap = self.cap.as_dict()
         return {
             "capacity": cap,
@@ -427,7 +438,12 @@ class Engine:
         """
         status = self.status()
         free = status["free"]
-        if resources.cpu > free["cpu"] or resources.mem_mb > free["mem_mb"] or resources.gpu > free["gpu"]:
+        if (
+            resources.cpu > free["cpu"]
+            or resources.mem_mb > free["mem_mb"]
+            or resources.gpu > free["gpu"]
+            or resources.gpu_mem_mb > free.get("gpu_mem_mb", 0)
+        ):
             return None
         lease_id = secrets.token_hex(8)
         self.store.add_lease(lease_id, project, session_id, resources, reason)
