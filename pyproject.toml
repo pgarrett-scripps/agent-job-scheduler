@@ -1,0 +1,62 @@
+[project]
+name = "agent-job-scheduler"
+version = "0.1.0"
+description = "Local admission-control scheduler so multiple coding agents can share one machine without corrupting each other's runs."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "typer>=0.15",
+    "rich>=13.0",
+]
+authors = [
+    { name = "Patrick Garrett", email = "pgarrett@scripps.edu" }
+]
+maintainers = [
+    { name = "Patrick Garrett", email = "pgarrett@scripps.edu" }
+]
+classifiers = [
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: POSIX :: Linux",
+    "Typing :: Typed",
+]
+
+[project.scripts]
+ajs = "ajs.cli:main"
+ajsd = "ajs.daemon:main"
+ajs-mcp = "ajs.mcp_server:main"
+
+[project.optional-dependencies]
+mcp = ["fastmcp>=2.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ajs"]
+
+[tool.uv]
+package = true
+dev-dependencies = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.9",
+    "ty>=0.0.1a7",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # Pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
