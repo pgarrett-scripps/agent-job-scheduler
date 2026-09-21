@@ -41,6 +41,20 @@ To keep it running across logins:
 ajs service install    # writes a systemd --user unit
 ```
 
+## What to queue
+
+Heavy work only: **several cores at once, many GB of RAM, or the GPU.** Parallel builds
+and test suites, data processing over large files, searches, sweeps, model runs,
+benchmarks you intend to report.
+
+Everything else runs directly — document builds, linters, git, package installs,
+single-threaded scripts. Wall-clock time is not the test: a five-minute single-threaded
+LaTeX build is not worth queueing, a ten-second 20-core compile is.
+
+The scheduler queues work; it never vetoes it. A busy machine is not a reason for an
+agent to refuse or postpone a task, and the MCP instructions say so explicitly — that
+distinction has to be stated, or agents read "the machine is busy" as "I should stop".
+
 ## Use from an agent
 
 Register the MCP server once per agent platform:

@@ -25,17 +25,31 @@ except ImportError:  # pragma: no cover
 
 INSTRUCTIONS = """
 Shared-machine job scheduler. Several coding agents work on this one computer at the
-same time, so expensive commands must be queued here instead of run directly.
+same time. This exists to stop genuinely heavy jobs colliding. It is not a gate on
+ordinary work.
 
-Use `submit_job` (or `run_job`) for any command that will take more than ~30 seconds or
-use more than one core: test suites, builds, data processing, searches, benchmarks.
-Cheap commands -- ls, cat, git status, a quick grep -- should just be run directly; they
-are not worth queueing.
+NEVER refuse, delay, or ask permission for a task because the machine is busy. The
+scheduler queues jobs, it does not veto them, and most commands should not come here at
+all. Do not tell the user you are waiting for resources to free up. Do not treat a
+`contended` result as a reason to stop doing what was asked. If you are unsure whether
+something is heavy enough to queue, just run it directly.
+
+Queue a command only if it will use SEVERAL CORES AT ONCE, MANY GB OF RAM, OR THE GPU:
+parallel builds and test suites (cargo build/test, make -j, pytest -n), data processing
+over large files, proteomics searches, parameter sweeps, model training or inference,
+and benchmarks whose numbers will be reported.
+
+Run everything else directly, without comment: document builds (latexmk, tectonic,
+pandoc, quarto, sphinx), git, ls, cat, grep, rg, find, linters and formatters, package
+installs, single-threaded scripts, short test runs.
+
+Wall-clock time is NOT the test. A five-minute single-threaded LaTeX build is not worth
+queueing; a ten-second 20-core compile is.
 
 If you are measuring how long something takes, you MUST pass exclusive=true. That makes
-the scheduler drain the machine, wait for it to go quiet, and run your job alone, then
+the scheduler take the whole machine, wait for it to go quiet, run your job alone, and
 report whether anything else interfered. A timing run without it is unreliable and the
-number should not be trusted.
+number should not be trusted. This is the one case where waiting is correct.
 
 For GPU work, pass gpu=1 and declare `gpu_mem`. The card has 4 GB total, so a job that
 does not say how much VRAM it needs is charged for the whole thing and will serialise
@@ -43,8 +57,9 @@ against every other GPU job. GPU timing runs use gpu_exclusive=true, which is a 
 switch from `exclusive`: a CPU benchmark does not need the card idle, and a GPU benchmark
 does not need all 20 cores. Set both only if the job genuinely needs both.
 
-Always declare `cpu` and `mem` honestly. The scheduler hands out slots based on what you
-claim, so under-declaring causes the overloading this exists to prevent.
+When you do queue something, declare `cpu` and `mem` honestly. The scheduler hands out
+slots based on what you claim, so under-declaring causes the overloading this exists to
+prevent.
 """
 
 
@@ -83,9 +98,12 @@ def build_server() -> Any:
     ) -> dict[str, Any]:
         """Queue a command and return immediately with a job id.
 
-        Use this for anything expensive (>30s or >1 core). It returns right away, so you
-        can do other work and call `wait_for_job` later. For a command you need the
-        result of before continuing, `run_job` is simpler.
+        For heavy work only: several cores at once, many GB of RAM, or the GPU. Document
+        builds, linters, git, and single-threaded scripts should be run directly instead
+        -- queueing them adds latency and buys nothing.
+
+        It returns right away, so you can do other work and call `wait_for_job` later.
+        For a command you need the result of before continuing, `run_job` is simpler.
 
         Args:
             command: argv list, e.g. ["cargo", "test", "--release"]. Not a shell string.
@@ -165,11 +183,14 @@ def build_server() -> Any:
         timeout_seconds: int = 600,
         project: str | None = None,
     ) -> dict[str, Any]:
-        """Queue a command and wait for it, returning output. The common case.
+        """Queue a command and wait for it, returning output. The common case for heavy work.
 
         Behaves like running the command directly, except it waits its turn instead of
         piling onto a busy machine. Prefer this when you need the result before you can
         continue; use `submit_job` when you would rather get on with something else.
+
+        Only for work that is actually heavy (several cores, many GB, or the GPU). Run
+        light commands with your normal shell tool -- that is faster and always correct.
         """
         submitted = submit_job(
             command=command,
