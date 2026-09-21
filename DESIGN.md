@@ -148,6 +148,17 @@ to the whole machine. Two properties are deliberate:
 - **It is reported as usage, never as reduced capacity.** Shrinking `cap` would make a
   20-core exclusive job *impossible* the moment a browser opened. Treating foreign work as
   usage makes it wait instead.
+- **Exclusive jobs are exempt from it.** This machine is a laptop and always has a desktop
+  session on it. An exclusive job asks for the entire machine, so charging foreign load
+  against it too means the request exceeds what is free *by definition, forever* — the
+  timing run simply never starts. What exclusivity can honestly guarantee here is that no
+  other **ajs job** runs alongside; whether the desktop interfered is then measured and
+  reported by the contention monitor rather than pretended away in advance. Exclusive
+  jobs still wait for other ajs jobs.
+- **A desktop allowance is subtracted first.** `external_cpu_allowance` (2 cores) and
+  `mem_reserve_mb` are deducted from the measurement before anything is charged. The
+  memory one also fixes a double-count: capacity is already `total − mem_reserve_mb`, so
+  billing the desktop's measured usage on top charged it twice.
 - **A job blocked only by foreign load gets no reservation promise.** Reservations bound a
   wait by projecting running jobs' `max_runtime`; nothing declares when a browser closes.
   Such a reservation is flagged `external` and does not veto backfill — holding cores empty
@@ -158,9 +169,9 @@ compile would evict a queued job. Memory is not: it is a level rather than a rat
 reacting late to it risks an OOM. Foreign CPU is floored to whole cores and capped at
 `cap.cpu − 1`, so a pathological reading throttles the queue but can never wedge it.
 
-This is also what makes `contention_threshold: 2.0` defensible. Ambient desktop load on
-this machine alone exceeds two cores, so without the admission guard every timing run
-would be stamped `contended` until the flag stopped meaning anything.
+`contention_threshold` is 4.0 for the same reason. A tighter value flags every run for
+having a browser open, and a flag that fires every time is one you stop reading. What it
+should catch is another job interfering, not Chrome.
 
 ## Timing runs
 

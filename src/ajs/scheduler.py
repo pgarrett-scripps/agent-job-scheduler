@@ -172,10 +172,20 @@ def plan(
     free = cap.as_dict()
     for job in running:
         _deduct(free, effective_request(job, cap))
-    for usage in (lease_usage, external_usage):
-        for key, amount in (usage or {}).items():
-            if key in free:
-                free[key] -= amount
+    for key, amount in (lease_usage or {}).items():
+        if key in free:
+            free[key] -= amount
+
+    # Two pools. An exclusive job asks for the entire machine, so if foreign load were
+    # charged against it too, it could never start on a laptop that always has a desktop
+    # session -- the request would exceed what is free by definition, forever. What
+    # exclusivity can actually guarantee here is that no *other ajs job* runs alongside;
+    # whether the desktop interfered is then measured and reported honestly by the
+    # contention monitor rather than pretended away in advance.
+    free_exclusive = dict(free)
+    for key, amount in (external_usage or {}).items():
+        if key in free:
+            free[key] -= amount
 
     locks: set[str] = set(held_locks or set())
     for job in running:
@@ -216,7 +226,8 @@ def plan(
             continue
 
         # --- availability --------------------------------------------------
-        if not _fits(need, free):
+        pool = free_exclusive if (job.resources.exclusive or job.resources.gpu_exclusive) else free
+        if not _fits(need, pool):
             outside = _external_note(external_usage)
             if reservation is None:
                 reservation = _reserve(job, need, running, cap, now, external_usage)
@@ -253,11 +264,13 @@ def plan(
                 # Hold the resources rather than letting something else grab them, or we
                 # would never get through the settle period.
                 _deduct(free, need)
+                _deduct(free_exclusive, need)
                 locks |= job_locks
                 continue
 
         decision.start.append(job.id)
         _deduct(free, need)
+        _deduct(free_exclusive, need)
         locks |= job_locks
         per_project[job.project] = per_project.get(job.project, 0) + 1
 

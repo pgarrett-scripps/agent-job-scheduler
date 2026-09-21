@@ -278,8 +278,14 @@ class ExternalLoad:
             foreign += mem_mb
         self.gpu_mem_mb = foreign
 
-    def usage(self, cap_cpu: int) -> dict[str, int]:
+    def usage(self, cap_cpu: int, *, cpu_allowance: float = 0.0, mem_allowance_mb: int = 0) -> dict[str, int]:
         """Foreign usage as whole units, for subtraction from free capacity.
+
+        The allowances exist because this runs on a laptop, where a browser and a
+        desktop session are permanent facts rather than transient interference. Capacity
+        already holds memory back for the desktop via ``mem_reserve_mb``; charging the
+        desktop's *measured* usage on top of that bills it twice and shrinks the queue
+        for nothing. Only load above the allowance is treated as real contention.
 
         Rounded *down* so that rounding never invents contention out of a fractional
         core, and clamped to ``cap_cpu - 1`` so foreign load can throttle the queue but
@@ -291,9 +297,11 @@ class ExternalLoad:
             cores = sysinfo.load_average()[0]
         else:
             cores = self.cpu_cores
+        cores = max(0.0, cores - cpu_allowance)
+        mem = max(0, self.mem_mb - mem_allowance_mb)
         return {
             "cpu": min(max(0, int(cores)), max(0, cap_cpu - 1)),
-            "mem_mb": self.mem_mb,
+            "mem_mb": mem,
             "gpu": 0,
             # Deliberately charged as VRAM rather than as a whole GPU: a 300 MB browser
             # compositor should shrink what a job may allocate, not make the card look

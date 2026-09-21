@@ -111,14 +111,21 @@ class Config:
     """Quiet period between the last job exiting and an exclusive job starting, so page
     cache writeback and dying processes stop perturbing the measurement."""
 
-    contention_threshold: float = 2.0
+    contention_threshold: float = 4.0
     """Foreign CPU cores (work not attributable to the job's own cgroup) above which an
     exclusive run is stamped `contended`.
 
-    2.0 is deliberately tight. It only holds up because `track_external_load` stops an
-    exclusive job from starting on an already-busy machine; without that, ambient
-    desktop load alone exceeds it and every timing run gets flagged until the flag
-    means nothing."""
+    Set for a laptop that always has a desktop session on it. A tighter value flags
+    every run for having a browser open, and a flag that fires every time is one you
+    stop reading. What this should catch is another *job* interfering, not Chrome."""
+
+    external_cpu_allowance: float = 2.0
+    """Ambient desktop load, in cores, that is not charged against capacity.
+
+    This is a laptop with a browser, a compositor and chat apps permanently running.
+    Charging that baseline to the queue makes the scheduler feel broken for no benefit:
+    the OS timeshares a couple of busy desktop cores against batch work perfectly well.
+    Only foreign load *above* this is real contention."""
 
     track_external_load: bool = True
     """Count CPU and memory used by processes ajs did not start against free capacity.

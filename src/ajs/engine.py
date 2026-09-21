@@ -166,7 +166,11 @@ class Engine:
     def _external_usage(self) -> dict[str, int] | None:
         if not self.cfg.track_external_load:
             return None
-        return self.external.usage(self.cap.cpu)
+        return self.external.usage(
+            self.cap.cpu,
+            cpu_allowance=self.cfg.external_cpu_allowance,
+            mem_allowance_mb=self.cfg.mem_reserve_mb,
+        )
 
     def _lease_usage(self) -> dict[str, int]:
         usage = {"cpu": 0, "mem_mb": 0, "gpu": 0, "gpu_mem_mb": 0}

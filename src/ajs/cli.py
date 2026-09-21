@@ -291,8 +291,8 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
         # Shown separately from `used` so it is obvious these cores are not ajs's doing
         # and will not be freed by cancelling a job.
         console.print(
-            f"[yellow]outside ajs[/yellow] {ext.get('cpu', 0)} cpu, {ext.get('mem_mb', 0)} MB "
-            f"[dim](deducted from what the scheduler will hand out)[/dim]"
+            f"[dim]outside ajs {ext.get('cpu', 0)} cpu, {ext.get('mem_mb', 0)} MB "
+            f"beyond the desktop allowance; timing runs ignore this[/dim]"
         )
     disk_colour = "red" if data["free_disk_mb"] < data["disk_floor_mb"] else "dim"
     console.print(

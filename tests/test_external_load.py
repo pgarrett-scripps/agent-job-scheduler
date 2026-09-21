@@ -108,9 +108,12 @@ def test_foreign_load_keeps_a_job_from_starting(cfg, cap):
     assert "outside ajs" in busy.blocked[1]
 
 
-def test_foreign_load_does_not_make_a_job_impossible(cfg, cap):
-    """It is usage, not a smaller machine -- otherwise a browser would permanently
-    disqualify every exclusive run."""
+def test_a_timing_run_still_starts_with_the_desktop_running(cfg, cap):
+    """An exclusive job asks for the whole machine. If foreign load were charged against
+    it too, it could never start on a laptop that always has a browser open -- the
+    request would exceed what is free by definition, forever. Exclusivity here means no
+    other *ajs job* runs alongside; the contention monitor reports what the desktop did.
+    """
     decision = plan(
         queued=[make_job(1, exclusive=True)],
         running=[],
@@ -118,9 +121,38 @@ def test_foreign_load_does_not_make_a_job_impossible(cfg, cap):
         cfg=cfg,
         now=NOW,
         last_start={},
-        external_usage={"cpu": 19, "mem_mb": 0, "gpu": 0},
+        external_usage={"cpu": 19, "mem_mb": 40000, "gpu": 0},
     )
-    assert "impossible" not in decision.blocked[1]
+    assert decision.start == [1]
+
+
+def test_a_timing_run_still_waits_for_other_ajs_jobs(cfg, cap):
+    """The exemption is for foreign load only -- it must not become a way to trample
+    another job that the scheduler itself started."""
+    running = [make_job(9, project="other", cpu=4, state=JobState.RUNNING, started_at=NOW)]
+    decision = plan(
+        queued=[make_job(1, exclusive=True)],
+        running=running,
+        cap=cap,
+        cfg=cfg,
+        now=NOW,
+        last_start={},
+        external_usage={"cpu": 2, "mem_mb": 0, "gpu": 0},
+    )
+    assert decision.start == []
+
+
+def test_an_ordinary_job_is_still_throttled_by_foreign_load(cfg, cap):
+    decision = plan(
+        queued=[make_job(1, cpu=16)],
+        running=[],
+        cap=cap,
+        cfg=cfg,
+        now=NOW,
+        last_start={},
+        external_usage={"cpu": 8, "mem_mb": 0, "gpu": 0},
+    )
+    assert decision.start == []
 
 
 def test_a_job_blocked_only_by_foreign_load_gets_no_reservation_promise(cfg, cap):
@@ -172,3 +204,39 @@ def test_ajs_reservations_still_veto_backfill(cfg, cap):
     assert not decision.reservation.external
     assert decision.start == []
     assert "would delay reserved job" in decision.blocked[2]
+
+
+# --- laptop allowances -----------------------------------------------------
+
+
+def test_ambient_desktop_cpu_is_not_charged_to_the_queue(fake_machine):
+    """A browser and a compositor are permanent facts on a laptop, not interference."""
+    ext = ExternalLoad(half_life_s=0.0)
+    ext.sample(now=0.0, own_cpu_seconds=0.0, own_mem_mb=0)
+    fake_machine["busy"] = 18.0  # 1.8 cores
+    ext.sample(now=10.0, own_cpu_seconds=0.0, own_mem_mb=0)
+    assert ext.usage(cap_cpu=20, cpu_allowance=2.0)["cpu"] == 0
+
+
+def test_cpu_above_the_allowance_is_still_charged(fake_machine):
+    ext = ExternalLoad(half_life_s=0.0)
+    ext.sample(now=0.0, own_cpu_seconds=0.0, own_mem_mb=0)
+    fake_machine["busy"] = 90.0  # 9 cores
+    ext.sample(now=10.0, own_cpu_seconds=0.0, own_mem_mb=0)
+    assert ext.usage(cap_cpu=20, cpu_allowance=2.0)["cpu"] == 7
+
+
+def test_desktop_memory_is_not_billed_twice(fake_machine):
+    """Capacity already withholds mem_reserve_mb for the desktop. Charging the desktop's
+    measured usage on top of that shrinks the queue for no reason."""
+    fake_machine["available"] = 64000 - 8000  # 8 GB in use, all of it desktop
+    ext = ExternalLoad()
+    ext.sample(now=0.0, own_cpu_seconds=0.0, own_mem_mb=0)
+    assert ext.usage(cap_cpu=20, mem_allowance_mb=6144)["mem_mb"] == 8000 - 6144
+
+
+def test_memory_allowance_never_goes_negative(fake_machine):
+    fake_machine["available"] = 64000 - 1000
+    ext = ExternalLoad()
+    ext.sample(now=0.0, own_cpu_seconds=0.0, own_mem_mb=0)
+    assert ext.usage(cap_cpu=20, mem_allowance_mb=6144)["mem_mb"] == 0

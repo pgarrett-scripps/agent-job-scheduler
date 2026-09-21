@@ -149,6 +149,13 @@ ajs submit --cpu 8 -- sh -c 'cargo test --release -j $AJS_CPU'
   scheduler when a process it did not start will exit. Set `track_external_load: false`
   if ajs is the only thing that ever runs on the machine.
 
+  Two allowances keep this usable on a laptop. A desktop baseline
+  (`external_cpu_allowance`, 2 cores, plus `mem_reserve_mb`) is subtracted before
+  anything is charged, and **exclusive jobs ignore foreign load entirely** — on a machine
+  that always has a browser open, a job asking for the whole machine would otherwise
+  never start. Exclusivity means no other *ajs job* runs alongside; the contention report
+  tells you what the desktop actually did.
+
 ## Enforcement
 
 Jobs run in transient systemd scopes with `CPUQuota` and `MemoryMax` applied, so a job
