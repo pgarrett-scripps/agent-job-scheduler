@@ -81,3 +81,11 @@ class TestForwardedEnv:
     def test_bad_entry_is_rejected(self):
         with pytest.raises(ValueError):
             forwarded_env({}, extra=["=oops"])
+
+
+def test_session_identity_prefers_explicit_then_claude_then_user():
+    from ajs.cli import session_identity
+
+    assert session_identity({"AJS_SESSION": "x", "CLAUDE_CODE_SESSION_ID": "c"}) == "x"
+    assert session_identity({"CLAUDE_CODE_SESSION_ID": "c", "USER": "u"}) == "claude:c"
+    assert session_identity({"USER": "u"}) == "user:u"

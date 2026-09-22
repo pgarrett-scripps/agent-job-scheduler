@@ -20,7 +20,7 @@ from .config import Config, db_path, log_dir
 from .contention import ContentionMonitor, ExternalLoad
 from .db import Store
 from .executor import Executor, RunningProcess
-from .models import Job, JobClass, JobState, ResourceRequest
+from .models import Job, JobClass, JobState, ResourceRequest, short_actor
 from .scheduler import Capacity, Decision, effective_request, plan
 
 log = logging.getLogger("ajs.engine")
@@ -109,11 +109,14 @@ class Engine:
                 blocked={
                     j.id: "scheduler is paused" if self.paused else "scheduler is draining"
                     for j in self.store.jobs_in_state(JobState.QUEUED)
+                    if not j.held
                 }
             )
             return
 
-        queued = self.store.jobs_in_state(JobState.QUEUED)
+        # Held jobs are invisible to the planner: they neither start nor claim the
+        # reservation, so holding a starved giant also stops it vetoing backfill.
+        queued = [j for j in self.store.jobs_in_state(JobState.QUEUED) if not j.held]
         running = self.store.jobs_in_state(JobState.RUNNING)
         if not queued:
             self.last_decision = Decision()
@@ -328,6 +331,8 @@ class Engine:
         locks: list[str] | None = None,
         max_runtime_s: int | None = None,
         job_class: str = "batch",
+        note: str | None = None,
+        held: bool = False,
     ) -> Job:
         resources = ResourceRequest(
             cpu=cpu,
@@ -348,9 +353,52 @@ class Engine:
             resources=resources,
             max_runtime_s=max_runtime_s or self.cfg.default_max_runtime_s,
             job_class=JobClass(job_class),
+            note=note or None,
+            held=held,
         )
+        if held:
+            self.store.add_event(job.id, actor=session_id, action="hold", reason="submitted held")
         self.wake()
         return job
+
+    # --- queue management ---------------------------------------------------
+
+    def _queued_job(self, job_id: int) -> Job:
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise ValueError(f"no such job: {job_id}")
+        if job.state is not JobState.QUEUED:
+            raise ValueError(f"job {job_id} is {job.state}; only queued jobs can be managed")
+        return job
+
+    def hold(self, job_id: int, *, actor: str, reason: str) -> Job:
+        """Keep a queued job out of scheduling until released."""
+        job = self._queued_job(job_id)
+        if not job.held:
+            self.store.update_job(job_id, held=1, reserved_until=None)
+            self.store.add_event(job_id, actor=actor, action="hold", reason=reason)
+            self.wake()
+        return self._queued_job(job_id)
+
+    def release(self, job_id: int, *, actor: str, reason: str = "") -> Job:
+        job = self._queued_job(job_id)
+        if job.held:
+            self.store.update_job(job_id, held=0)
+            self.store.add_event(job_id, actor=actor, action="release", reason=reason)
+            self.wake()
+        return self._queued_job(job_id)
+
+    def set_priority(self, job_id: int, job_class: str, *, actor: str, reason: str) -> Job:
+        """Move a queued job to another priority band."""
+        new = JobClass(job_class)
+        job = self._queued_job(job_id)
+        if job.job_class is not new:
+            self.store.update_job(job_id, job_class=str(new))
+            self.store.add_event(
+                job_id, actor=actor, action="priority", detail=f"{job.job_class} -> {new}", reason=reason
+            )
+            self.wake()
+        return self._queued_job(job_id)
 
     async def cancel(self, job_id: int, reason: str = "cancelled by user") -> bool:
         job = self.store.get_job(job_id)
@@ -396,7 +444,17 @@ class Engine:
                 fut.set_result(None)
 
     def blocked_reason(self, job_id: int) -> str | None:
-        return self.last_decision.blocked.get(job_id)
+        reason = self.last_decision.blocked.get(job_id)
+        if reason is not None:
+            return reason
+        job = self.store.get_job(job_id)
+        if job is not None and job.held:
+            event = self.store.last_event(job_id, "hold")
+            if event is None:
+                return "held"
+            why = f": {event['reason']}" if event.get("reason") else ""
+            return f"held by {short_actor(str(event.get('actor') or 'unknown'))}{why}"
+        return None
 
     def status(self) -> dict[str, Any]:
         running = self.store.jobs_in_state(JobState.RUNNING)

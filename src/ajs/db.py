@@ -61,12 +61,31 @@ CREATE TABLE IF NOT EXISTS leases (
 
 CREATE INDEX IF NOT EXISTS idx_leases_active ON leases(released_at);
 
+-- Audit trail for queue management: who held, released or re-prioritised what, and why.
+CREATE TABLE IF NOT EXISTS job_events (
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id  INTEGER NOT NULL,
+    at      REAL NOT NULL,
+    actor   TEXT NOT NULL DEFAULT '',
+    action  TEXT NOT NULL,
+    detail  TEXT,
+    reason  TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_events_job ON job_events(job_id);
+
 -- Round-robin bookkeeping for fair-share between projects.
 CREATE TABLE IF NOT EXISTS project_stats (
     project        TEXT PRIMARY KEY,
     last_started_at REAL NOT NULL DEFAULT 0
 );
 """
+
+
+_ADDED_COLUMNS = (
+    ("held", "INTEGER NOT NULL DEFAULT 0"),
+    ("note", "TEXT"),
+)
 
 
 class Store:
@@ -81,6 +100,15 @@ class Store:
         self.conn.execute("PRAGMA synchronous=NORMAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after the first schema. CREATE TABLE IF NOT EXISTS does
+        not touch an existing table, so a live database needs them added in place."""
+        have = {r["name"] for r in self.conn.execute("PRAGMA table_info(jobs)")}
+        for name, ddl in _ADDED_COLUMNS:
+            if name not in have:
+                self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {ddl}")
 
     def close(self) -> None:
         self.conn.close()
@@ -98,12 +126,15 @@ class Store:
         resources: ResourceRequest,
         max_runtime_s: int,
         job_class: JobClass,
+        note: str | None = None,
+        held: bool = False,
     ) -> Job:
         now = time.time()
         cur = self.conn.execute(
             """INSERT INTO jobs
-               (project, session_id, cmd, cwd, env, resources, max_runtime_s, job_class, state, submitted_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+               (project, session_id, cmd, cwd, env, resources, max_runtime_s, job_class, state, submitted_at,
+                note, held)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 project,
                 session_id,
@@ -115,6 +146,8 @@ class Store:
                 str(job_class),
                 str(JobState.QUEUED),
                 now,
+                note,
+                int(held),
             ),
         )
         job_id = int(cur.lastrowid or 0)
@@ -160,6 +193,25 @@ class Store:
         args.append(limit)
         rows = self.conn.execute(f"SELECT * FROM jobs {where} ORDER BY id DESC LIMIT ?", tuple(args)).fetchall()
         return [_row_to_job(r) for r in rows]
+
+    # --- queue-management audit trail ---------------------------------------
+
+    def add_event(self, job_id: int, *, actor: str, action: str, detail: str = "", reason: str = "") -> None:
+        self.conn.execute(
+            "INSERT INTO job_events(job_id, at, actor, action, detail, reason) VALUES(?,?,?,?,?,?)",
+            (job_id, time.time(), actor, action, detail, reason),
+        )
+
+    def events(self, *, job_id: int | None = None, limit: int = 50) -> list[dict[str, object]]:
+        where, args = ("WHERE job_id=?", (job_id, limit)) if job_id is not None else ("", (limit,))
+        rows = self.conn.execute(f"SELECT * FROM job_events {where} ORDER BY id DESC LIMIT ?", args).fetchall()
+        return [dict(r) for r in rows]
+
+    def last_event(self, job_id: int, action: str) -> dict[str, object] | None:
+        row = self.conn.execute(
+            "SELECT * FROM job_events WHERE job_id=? AND action=? ORDER BY id DESC LIMIT 1", (job_id, action)
+        ).fetchone()
+        return dict(row) if row else None
 
     # --- fair share -------------------------------------------------------
 
@@ -237,4 +289,6 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         contention_note=row["contention_note"],
         reserved_until=row["reserved_until"],
         cancel_reason=row["cancel_reason"],
+        held=bool(row["held"]),
+        note=row["note"],
     )

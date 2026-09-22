@@ -59,6 +59,9 @@ class Server:
                     response = protocol.ok(result)
                 except TypeError as exc:
                     response = protocol.err(f"bad parameters for {method}: {exc}")
+                except ValueError as exc:
+                    # A refused request (bad class, job not queued), not a daemon fault.
+                    response = protocol.err(f"ValueError: {exc}")
                 except Exception as exc:  # pragma: no cover - surface to the caller
                     log.exception("error handling %s", method)
                     response = protocol.err(f"{type(exc).__name__}: {exc}")
@@ -123,6 +126,18 @@ class Server:
 
     async def do_cancel(self, job_id: int, reason: str = "cancelled by user") -> bool:
         return await self.engine.cancel(int(job_id), reason)
+
+    def do_hold(self, job_id: int, actor: str = "", reason: str = "") -> dict[str, Any]:
+        return self.engine.hold(int(job_id), actor=actor, reason=reason).to_dict()
+
+    def do_release(self, job_id: int, actor: str = "", reason: str = "") -> dict[str, Any]:
+        return self.engine.release(int(job_id), actor=actor, reason=reason).to_dict()
+
+    def do_set_priority(self, job_id: int, job_class: str, actor: str = "", reason: str = "") -> dict[str, Any]:
+        return self.engine.set_priority(int(job_id), job_class, actor=actor, reason=reason).to_dict()
+
+    def do_events(self, job_id: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        return self.engine.store.events(job_id=None if job_id is None else int(job_id), limit=int(limit))
 
     def do_logs(self, job_id: int, lines: int = 50) -> str:
         return self.engine.log_tail(int(job_id), int(lines))

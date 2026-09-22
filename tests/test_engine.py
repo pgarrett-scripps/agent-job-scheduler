@@ -269,3 +269,75 @@ class TestExternalSampling:
         monkeypatch.setattr(engine.external, "sample", fake_sample)
         engine._sample_external(now=0.0)
         assert seen == {"cpu": 100.0, "mem": 100, "cgroups": {shared}}
+
+
+class TestQueueManagement:
+    async def test_held_job_never_starts_until_released(self, engine):
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", held=True)
+        for _ in range(3):
+            await engine.tick()
+        assert engine.store.get_job(job.id).state is JobState.QUEUED
+        assert engine.blocked_reason(job.id).startswith("held by s")
+
+        engine.release(job.id, actor="me", reason="go")
+        result = await drive(engine, job.id)
+        assert result["state"] == "done"
+
+    async def test_hold_records_actor_and_reason(self, engine):
+        engine.paused = True
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")
+        engine.hold(job.id, actor="manager", reason="long timing run, not now")
+        assert engine.store.get_job(job.id).held
+        assert engine.blocked_reason(job.id) == "held by manager: long timing run, not now"
+        [event] = engine.store.events(job_id=job.id)
+        assert (event["actor"], event["action"]) == ("manager", "hold")
+
+    async def test_held_job_does_not_claim_the_reservation(self, engine):
+        """A held giant must not veto backfill for everyone else."""
+        big = engine.submit(project="a", session_id="s", cmd=["/bin/true"], cwd="/tmp", exclusive=True)
+        engine.hold(big.id, actor="m", reason="later")
+        await engine.tick()
+        assert engine.store.get_job(big.id).state is JobState.QUEUED
+        assert engine.last_decision.reservation is None or engine.last_decision.reservation.job_id != big.id
+
+    async def test_set_priority_changes_class_and_logs_it(self, engine):
+        engine.paused = True
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")
+        engine.set_priority(job.id, "background", actor="m", reason="4h timing")
+        assert str(engine.store.get_job(job.id).job_class) == "background"
+        [event] = engine.store.events(job_id=job.id)
+        assert event["detail"] == "batch -> background"
+
+    async def test_only_queued_jobs_can_be_managed(self, engine):
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")
+        await drive(engine, job.id)
+        with pytest.raises(ValueError, match="only queued"):
+            engine.hold(job.id, actor="m", reason="x")
+
+    async def test_note_is_stored(self, engine):
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", note="fig 3")
+        assert engine.store.get_job(job.id).to_dict()["note"] == "fig 3"
+
+
+def test_old_database_gains_new_columns(tmp_path):
+    import sqlite3
+
+    path = tmp_path / "old.db"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE jobs (id INTEGER PRIMARY KEY, project TEXT, session_id TEXT, cmd TEXT, cwd TEXT, env TEXT,"
+        " resources TEXT, max_runtime_s INTEGER, job_class TEXT, state TEXT, submitted_at REAL, started_at REAL,"
+        " finished_at REAL, exit_code INTEGER, pid INTEGER, unit TEXT, log_path TEXT, load_before REAL,"
+        " load_after REAL, contended INTEGER DEFAULT 0, contention_note TEXT, reserved_until REAL,"
+        " cancel_reason TEXT)"
+    )
+    conn.execute(
+        "INSERT INTO jobs(project, session_id, cmd, cwd, env, resources, max_runtime_s, job_class, state,"
+        " submitted_at) VALUES('p','', '[\"true\"]','/tmp','{}','{\"cpu\":1}',60,'batch','queued',1.0)"
+    )
+    conn.commit()
+    conn.close()
+    store = Store(path)
+    [job] = store.jobs_in_state(JobState.QUEUED)
+    assert job.held is False and job.note is None
+    store.close()

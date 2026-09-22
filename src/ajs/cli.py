@@ -24,6 +24,7 @@ from . import protocol
 from .advice import submission_warnings
 from .client import Client
 from .config import Config, config_path, socket_path, state_dir
+from .models import short_actor
 
 app = typer.Typer(
     add_completion=False,
@@ -122,6 +123,20 @@ def forwarded_env(source: Mapping[str, str] | None = None, extra: list[str] | No
     return env
 
 
+def session_identity(source: Mapping[str, str] | None = None) -> str:
+    """Who is calling: an explicit AJS_SESSION, else the Claude Code session, else the user.
+
+    Recorded on submissions and on every queue-management action, so the queue can be
+    traced back to the agent that owns a job and `ajs events` shows who moved what.
+    """
+    env = os.environ if source is None else source
+    if env.get("AJS_SESSION"):
+        return env["AJS_SESSION"]
+    if env.get("CLAUDE_CODE_SESSION_ID"):
+        return f"claude:{env['CLAUDE_CODE_SESSION_ID']}"
+    return f"user:{env.get('USER', 'unknown')}"
+
+
 def _client() -> Client:
     return Client()
 
@@ -157,6 +172,10 @@ def submit(
     job_class: Annotated[str, typer.Option("--class", help="interactive | batch | background")] = "batch",
     project: Annotated[str | None, typer.Option("--project", "-p", help="Defaults to the git repo name.")] = None,
     session: Annotated[str, typer.Option("--session", help="Opaque submitter id.")] = "",
+    note: Annotated[
+        str, typer.Option("--note", "-n", help="What this job is for, e.g. 'last figure for the uno paper'.")
+    ] = "",
+    hold: Annotated[bool, typer.Option("--hold", help="Queue it held: it will not start until `ajs release`.")] = False,
     env: Annotated[
         list[str] | None,
         typer.Option("--env", "-e", help="Extra environment for the job: KEY=VALUE, or KEY to copy from your shell."),
@@ -184,7 +203,7 @@ def submit(
     try:
         job = client.submit(
             project=project or detect_project(),
-            session_id=session or os.environ.get("AJS_SESSION", ""),
+            session_id=session or session_identity(),
             cmd=cmd,
             cwd=str(Path.cwd()),
             env=job_env,
@@ -198,6 +217,9 @@ def submit(
             locks=list(lock or []),
             max_runtime_s=max_runtime_s,
             job_class=job_class,
+            # Only sent when used, so this client still talks to a daemon that predates them.
+            **({"note": note} if note else {}),
+            **({"held": True} if hold else {}),
         )
     except protocol.SchedulerError as exc:
         _fail(str(exc))
@@ -286,6 +308,85 @@ def cancel(
             _fail(f"job {job_id} is not cancellable (already finished, or does not exist)")
     except protocol.SchedulerError as exc:
         _fail(str(exc))
+
+
+@app.command(name="hold")
+def hold_cmd(
+    job_ids: Annotated[list[int], typer.Argument(help="Queued job id(s).")],
+    reason: Annotated[str, typer.Option("--reason", "-r", help="Why; recorded in `ajs events`.")] = "",
+) -> None:
+    """Keep queued job(s) from starting until released. They keep their place."""
+    client = _client()
+    for job_id in job_ids:
+        try:
+            client.hold(job_id, actor=session_identity(), reason=reason)
+            console.print(f"[yellow]held[/yellow] job {job_id}")
+        except protocol.SchedulerError as exc:
+            _fail(str(exc))
+
+
+@app.command(name="release")
+def release_cmd(
+    job_ids: Annotated[list[int], typer.Argument(help="Held job id(s).")],
+    reason: Annotated[str, typer.Option("--reason", "-r")] = "",
+) -> None:
+    """Let held job(s) be scheduled again."""
+    client = _client()
+    for job_id in job_ids:
+        try:
+            client.release(job_id, actor=session_identity(), reason=reason)
+            console.print(f"[green]released[/green] job {job_id}")
+        except protocol.SchedulerError as exc:
+            _fail(str(exc))
+
+
+@app.command(name="priority")
+def priority_cmd(
+    job_class: Annotated[str, typer.Argument(help="interactive | batch | background")],
+    job_ids: Annotated[list[int], typer.Argument(help="Queued job id(s).")],
+    reason: Annotated[str, typer.Option("--reason", "-r", help="Why; recorded in `ajs events`.")] = "",
+) -> None:
+    """Move queued job(s) to another priority band. Example: ajs priority background 172 177"""
+    client = _client()
+    for job_id in job_ids:
+        try:
+            client.set_priority(job_id, job_class, actor=session_identity(), reason=reason)
+            console.print(f"job {job_id} -> [bold]{job_class}[/bold]")
+        except protocol.SchedulerError as exc:
+            _fail(str(exc))
+
+
+@app.command(name="events")
+def events_cmd(
+    job_id: Annotated[int | None, typer.Argument(help="Only this job.")] = None,
+    limit: Annotated[int, typer.Option("--limit", "-n")] = 30,
+    json_out: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Audit trail of holds, releases and priority changes: who, when, why."""
+    try:
+        rows = _client().events(job_id, limit)
+    except protocol.SchedulerError as exc:
+        _fail(str(exc))
+        return
+    if json_out:
+        console.print_json(data=rows)
+        return
+    if not rows:
+        console.print("[dim]no queue-management events[/dim]")
+        return
+    table = Table(header_style="bold")
+    for col in ("when", "job", "action", "by", "reason"):
+        table.add_column(col, overflow="fold")
+    for row in rows:
+        action = row["action"] + (f" ({row['detail']})" if row.get("detail") else "")
+        table.add_row(
+            time.strftime("%m-%d %H:%M", time.localtime(row["at"])),
+            str(row["job_id"]),
+            action,
+            short_actor(row.get("actor") or "-"),
+            row.get("reason") or "-",
+        )
+    console.print(table)
 
 
 @app.command()
@@ -385,6 +486,7 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
         table = Table(title="queued", title_justify="left", header_style="bold")
         table.add_column("id", justify="right")
         table.add_column("project")
+        table.add_column("class")
         table.add_column("needs")
         table.add_column("waiting on", overflow="fold")
         for job in data["queued"]:
@@ -395,11 +497,15 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
                 needs += "/exclusive"
             if job.get("gpu_exclusive"):
                 needs += "/gpu-exclusive"
+            waiting = job.get("blocked_reason") or "-"
+            if job.get("note"):
+                waiting += f"\n[dim]for: {job['note']}[/dim]"
             table.add_row(
                 str(job["id"]),
                 job["project"],
+                "[yellow]HELD[/yellow]" if job.get("held") else job.get("class", "-"),
                 needs,
-                job.get("blocked_reason") or "-",
+                waiting,
             )
         console.print(table)
 
@@ -483,6 +589,8 @@ def ps_cmd(
     for job in jobs:
         state = job["state"]
         mark = " [yellow]!contended[/yellow]" if job.get("contended") else ""
+        if job.get("held") and state == "queued":
+            mark += " [yellow]held[/yellow]"
         table.add_row(
             str(job["id"]),
             f"[{colours.get(state, 'white')}]{state}[/{colours.get(state, 'white')}]{mark}",

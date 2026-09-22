@@ -85,6 +85,18 @@ class Client:
     def cancel(self, job_id: int, reason: str = "cancelled by user") -> bool:
         return bool(self.call("cancel", job_id=job_id, reason=reason))
 
+    def hold(self, job_id: int, *, actor: str, reason: str) -> dict[str, Any]:
+        return self.call("hold", job_id=job_id, actor=actor, reason=reason)
+
+    def release(self, job_id: int, *, actor: str, reason: str = "") -> dict[str, Any]:
+        return self.call("release", job_id=job_id, actor=actor, reason=reason)
+
+    def set_priority(self, job_id: int, job_class: str, *, actor: str, reason: str) -> dict[str, Any]:
+        return self.call("set_priority", job_id=job_id, job_class=job_class, actor=actor, reason=reason)
+
+    def events(self, job_id: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
+        return list(self.call("events", job_id=job_id, limit=limit))
+
     def jobs(self, **params: Any) -> list[dict[str, Any]]:
         return list(self.call("jobs", **params))
 

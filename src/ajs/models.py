@@ -127,6 +127,12 @@ class Job:
     # Set when the scheduler promises a starved job a start time (see scheduler.plan).
     reserved_until: float | None = None
     cancel_reason: str | None = None
+    # A held job stays queued but is never admitted until released. Queue management,
+    # not a lifecycle state: it can be flipped back and forth while the job waits.
+    held: bool = False
+    note: str | None = None
+    """Free text from the submitter on what the job is for, so whoever manages the queue
+    can tell a paper's last missing figure from an exploratory sweep."""
 
     @property
     def cmd_str(self) -> str:
@@ -171,4 +177,15 @@ class Job:
             "contention_note": self.contention_note,
             "reserved_until": self.reserved_until,
             "cancel_reason": self.cancel_reason,
+            "held": self.held,
+            "note": self.note,
         }
+
+
+def short_actor(actor: str) -> str:
+    """`claude:<uuid>` trimmed to its first block: enough to find the session in a list of
+    agents, short enough to fit a table column. Full ids stay in the database."""
+    kind, sep, rest = actor.partition(":")
+    if sep and kind == "claude":
+        return f"claude:{rest.split('-')[0]}"
+    return actor

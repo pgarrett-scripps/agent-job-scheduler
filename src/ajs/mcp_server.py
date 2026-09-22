@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .advice import submission_warnings
-from .cli import detect_project, forwarded_env, parse_duration, parse_mem
+from .cli import detect_project, forwarded_env, parse_duration, parse_mem, session_identity
 from .client import Client
 from .protocol import SchedulerError
 
@@ -64,6 +64,12 @@ output, rather than one multi-hour job. Other agents' jobs can then start betwee
 chunks instead of waiting hours. Never use exclusive=true for throughput: it drains the
 whole machine first. Submissions that look like either pattern come back with `warnings`.
 
+Pass `note` with every submission: one line on what the job is for and what it
+unblocks. The queue is ordered by people and agents reading those notes.
+
+Do not reorder the queue (hold_job, release_job, set_job_priority) unless the user has
+explicitly asked you to in this conversation. Cancelling your own job stays fine.
+
 When you do queue something, declare `cpu` and `mem` honestly. The scheduler hands out
 slots based on what you claim, so under-declaring causes the overloading this exists to
 prevent.
@@ -85,7 +91,7 @@ def build_server() -> Any:
         )
 
     mcp = FastMCP(name="ajs", instructions=INSTRUCTIONS)
-    session_id = os.environ.get("AJS_SESSION", f"pid-{os.getpid()}")
+    session_id = session_identity()
 
     @mcp.tool
     def submit_job(
@@ -103,6 +109,7 @@ def build_server() -> Any:
         job_class: str = "batch",
         project: str | None = None,
         env: dict[str, str] | None = None,
+        note: str = "",
     ) -> dict[str, Any]:
         """Queue a command and return immediately with a job id.
 
@@ -138,6 +145,9 @@ def build_server() -> Any:
             project: defaults to the git repo name at cwd.
             env: extra environment variables for the job. PATH and the usual toolchain
                 variables are forwarded from this session automatically.
+            note: one line on what the job is for and what it unblocks, e.g. "Table 2
+                timings for the spectrl paper". Whoever manages the queue uses this to
+                decide what goes first, so say it plainly.
         """
         try:
             work_dir = cwd or os.getcwd()
@@ -157,6 +167,7 @@ def build_server() -> Any:
                 locks=list(locks or []),
                 max_runtime_s=parse_duration(max_runtime),
                 job_class=job_class,
+                **({"note": note} if note else {}),
             )
             result: dict[str, Any] = {"ok": True, "job_id": job["id"], "state": job["state"]}
             warnings = submission_warnings(
@@ -259,6 +270,56 @@ def build_server() -> Any:
         except SchedulerError as exc:
             return _err(exc)
 
+    def _manage(action: str, job_id: int, reason: str, **extra: Any) -> dict[str, Any]:
+        if not reason.strip():
+            return {"ok": False, "error": "reason is required: say what the user asked for"}
+        try:
+            job = getattr(_client(), action)(job_id, **extra, actor=session_id, reason=reason)
+            return {"ok": True, "job": _summarise(job)}
+        except SchedulerError as exc:
+            return _err(exc)
+
+    @mcp.tool
+    def hold_job(job_id: int, reason: str) -> dict[str, Any]:
+        """Keep a queued job from starting until `release_job`. It keeps its place in line.
+
+        QUEUE MANAGEMENT: call this ONLY when the user has explicitly asked, in this
+        conversation, for this change to the queue. Never to get your own job ahead and
+        never on your own judgement: it reorders other agents' work. `reason` is required
+        and is recorded with your session in `ajs events`.
+        """
+        return _manage("hold", job_id, reason)
+
+    @mcp.tool
+    def release_job(job_id: int, reason: str) -> dict[str, Any]:
+        """Let a held job be scheduled again.
+
+        QUEUE MANAGEMENT: call this ONLY when the user has explicitly asked, in this
+        conversation, for this change to the queue. Never to get your own job ahead and
+        never on your own judgement: it reorders other agents' work. `reason` is required
+        and is recorded with your session in `ajs events`.
+        """
+        return _manage("release", job_id, reason)
+
+    @mcp.tool
+    def set_job_priority(job_id: int, job_class: str, reason: str) -> dict[str, Any]:
+        """Move a queued job to another band: "interactive", "batch" or "background".
+
+        QUEUE MANAGEMENT: call this ONLY when the user has explicitly asked, in this
+        conversation, for this change to the queue. Never to get your own job ahead and
+        never on your own judgement: it reorders other agents' work. `reason` is required
+        and is recorded with your session in `ajs events`.
+        """
+        return _manage("set_priority", job_id, reason, job_class=job_class)
+
+    @mcp.tool
+    def queue_events(job_id: int | None = None, limit: int = 30) -> dict[str, Any]:
+        """Audit trail of holds, releases and priority changes: who, when, why."""
+        try:
+            return {"ok": True, "events": _client().events(job_id, limit)}
+        except SchedulerError as exc:
+            return _err(exc)
+
     @mcp.tool
     def list_jobs(project: str | None = None, include_finished: bool = False, limit: int = 20) -> dict[str, Any]:
         """List jobs, most recent first. Includes other agents' jobs."""
@@ -313,6 +374,10 @@ def _summarise(job: dict[str, Any]) -> dict[str, Any]:
         "contention_note",
         "blocked_reason",
         "timed_out",
+        "class",
+        "held",
+        "note",
+        "session_id",
     )
     return {k: job[k] for k in keys if k in job and job[k] is not None}
 
