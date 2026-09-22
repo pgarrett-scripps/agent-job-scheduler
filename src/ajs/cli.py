@@ -21,6 +21,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import protocol
+from .advice import submission_warnings
 from .client import Client
 from .config import Config, config_path, socket_path, state_dir
 
@@ -201,6 +202,9 @@ def submit(
     except protocol.SchedulerError as exc:
         _fail(str(exc))
         return
+
+    for warning in submission_warnings(exclusive=exclusive, gpu_exclusive=gpu_exclusive, max_runtime_s=max_runtime_s):
+        err_console.print(f"[yellow]note:[/yellow] {warning}")
 
     if not wait:
         if json_out:

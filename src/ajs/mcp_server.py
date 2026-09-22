@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 from typing import Any
 
+from .advice import submission_warnings
 from .cli import detect_project, forwarded_env, parse_duration, parse_mem
 from .client import Client
 from .protocol import SchedulerError
@@ -56,6 +57,12 @@ does not say how much VRAM it needs is charged for the whole thing and will seri
 against every other GPU job. GPU timing runs use gpu_exclusive=true, which is a separate
 switch from `exclusive`: a CPU benchmark does not need the card idle, and a GPU benchmark
 does not need all 20 cores. Set both only if the job genuinely needs both.
+
+Split long runs. If a job would run over about 30 minutes and the work divides (per
+file, per sample, per parameter set), submit resumable chunks that each write their own
+output, rather than one multi-hour job. Other agents' jobs can then start between your
+chunks instead of waiting hours. Never use exclusive=true for throughput: it drains the
+whole machine first. Submissions that look like either pattern come back with `warnings`.
 
 When you do queue something, declare `cpu` and `mem` honestly. The scheduler hands out
 slots based on what you claim, so under-declaring causes the overloading this exists to
@@ -151,7 +158,13 @@ def build_server() -> Any:
                 max_runtime_s=parse_duration(max_runtime),
                 job_class=job_class,
             )
-            return {"ok": True, "job_id": job["id"], "state": job["state"]}
+            result: dict[str, Any] = {"ok": True, "job_id": job["id"], "state": job["state"]}
+            warnings = submission_warnings(
+                exclusive=exclusive, gpu_exclusive=gpu_exclusive, max_runtime_s=parse_duration(max_runtime)
+            )
+            if warnings:
+                result["warnings"] = warnings
+            return result
         except (SchedulerError, ValueError) as exc:
             return _err(exc)
 
@@ -214,6 +227,8 @@ def build_server() -> Any:
         waited = wait_for_job(submitted["job_id"], timeout_seconds=timeout_seconds)
         if waited.get("ok") and not waited.get("timed_out"):
             waited["output"] = get_job_logs(submitted["job_id"], lines=200).get("output", "")
+        if submitted.get("warnings"):
+            waited["warnings"] = submitted["warnings"]
         return waited
 
     @mcp.tool
