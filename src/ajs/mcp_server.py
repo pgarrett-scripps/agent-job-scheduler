@@ -14,7 +14,7 @@ import os
 from pathlib import Path
 from typing import Any
 
-from .cli import detect_project, parse_duration, parse_mem
+from .cli import detect_project, forwarded_env, parse_duration, parse_mem
 from .client import Client
 from .protocol import SchedulerError
 
@@ -95,6 +95,7 @@ def build_server() -> Any:
         max_runtime: str = "1h",
         job_class: str = "batch",
         project: str | None = None,
+        env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Queue a command and return immediately with a job id.
 
@@ -128,6 +129,8 @@ def build_server() -> Any:
             job_class: "interactive" if you are blocked waiting, else "batch", or
                 "background" for work nobody is waiting on.
             project: defaults to the git repo name at cwd.
+            env: extra environment variables for the job. PATH and the usual toolchain
+                variables are forwarded from this session automatically.
         """
         try:
             work_dir = cwd or os.getcwd()
@@ -136,6 +139,7 @@ def build_server() -> Any:
                 session_id=session_id,
                 cmd=command,
                 cwd=work_dir,
+                env={**forwarded_env(), **(env or {})},
                 cpu=cpu,
                 mem_mb=parse_mem(mem),
                 gpu=gpu,
@@ -285,6 +289,8 @@ def _summarise(job: dict[str, Any]) -> dict[str, Any]:
         "cmd_str",
         "exit_code",
         "runtime_s",
+        "cpu_now",
+        "mem_now_mb",
         "exclusive",
         "gpu_exclusive",
         "gpu_mem_mb",

@@ -240,3 +240,55 @@ def test_memory_allowance_never_goes_negative(fake_machine):
     ext = ExternalLoad()
     ext.sample(now=0.0, own_cpu_seconds=0.0, own_mem_mb=0)
     assert ext.usage(cap_cpu=20, mem_allowance_mb=6144)["mem_mb"] == 0
+
+
+def test_a_timing_run_blocked_by_ajs_jobs_still_gets_a_real_reservation(cfg, cap):
+    """Foreign load is exempt for exclusive jobs at admission, so it must be exempt when
+    projecting their start too. Otherwise the reservation comes back flagged external,
+    the backfill veto is dropped, and the timing run is starved by a trickle of small
+    jobs -- the exact failure reservations exist to prevent."""
+    running = [make_job(9, project="other", cpu=4, state=JobState.RUNNING, started_at=NOW - 100, max_runtime_s=600)]
+    timing = make_job(1, project="bench", exclusive=True, max_runtime_s=300)
+    long_job = make_job(2, project="other", cpu=2, max_runtime_s=3600, submitted_at=NOW + 1)
+    decision = plan(
+        queued=[timing, long_job],
+        running=running,
+        cap=cap,
+        cfg=cfg,
+        now=NOW,
+        last_start={},
+        external_usage={"cpu": 3, "mem_mb": 0, "gpu": 0, "gpu_mem_mb": 0},
+    )
+    assert decision.reservation is not None
+    assert decision.reservation.job_id == 1
+    assert not decision.reservation.external
+    assert decision.reservation.start_at == NOW + 500
+    assert decision.start == []
+    assert "would delay reserved job #1" in decision.blocked[2]
+
+
+def test_foreign_vram_is_charged_even_to_a_gpu_timing_run(cfg, cap):
+    """The desktop exemption is about CPU and memory. A hand-run model holding most of
+    the card is not ambient load: admitting a job on top of it means an OOM."""
+    decision = plan(
+        queued=[make_job(1, cpu=2, gpu_exclusive=True)],
+        running=[],
+        cap=cap,
+        cfg=cfg,
+        now=NOW,
+        last_start={},
+        external_usage={"cpu": 0, "mem_mb": 0, "gpu": 0, "gpu_mem_mb": 3000},
+    )
+    assert decision.start == []
+    assert "VRAM" in decision.blocked[1]
+
+    both = plan(
+        queued=[make_job(1, exclusive=True, gpu_exclusive=True)],
+        running=[],
+        cap=cap,
+        cfg=cfg,
+        now=NOW,
+        last_start={},
+        external_usage={"cpu": 19, "mem_mb": 40000, "gpu": 0, "gpu_mem_mb": 3000},
+    )
+    assert both.start == []  # exempt from the desktop's cpu/mem, still blocked by VRAM

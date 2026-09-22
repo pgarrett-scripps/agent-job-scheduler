@@ -2,7 +2,7 @@
 
 import pytest
 
-from ajs.cli import detect_project, parse_duration, parse_mem
+from ajs.cli import detect_project, forwarded_env, parse_duration, parse_mem
 
 
 class TestParseDuration:
@@ -58,3 +58,26 @@ class TestDetectProject:
         plain = tmp_path / "not-a-repo"
         plain.mkdir()
         assert detect_project(plain) == "not-a-repo"
+
+
+class TestParseMemUnits:
+    @pytest.mark.parametrize("text", ["", "8X", "lots"])
+    def test_garbage_is_a_value_error_not_a_traceback(self, text):
+        with pytest.raises(ValueError):
+            parse_mem(text)
+
+
+class TestForwardedEnv:
+    def test_only_toolchain_variables_are_forwarded(self):
+        source = {"PATH": "/a:/b", "VIRTUAL_ENV": "/venv", "ANTHROPIC_API_KEY": "sk-secret", "HOME": "/h"}
+        env = forwarded_env(source)
+        assert env == {"PATH": "/a:/b", "VIRTUAL_ENV": "/venv"}
+
+    def test_extra_entries_set_or_copy(self):
+        source = {"PATH": "/a", "RAYON_NUM_THREADS": "8"}
+        env = forwarded_env(source, extra=["FOO=bar", "RAYON_NUM_THREADS", "MISSING"])
+        assert env == {"PATH": "/a", "FOO": "bar", "RAYON_NUM_THREADS": "8"}
+
+    def test_bad_entry_is_rejected(self):
+        with pytest.raises(ValueError):
+            forwarded_env({}, extra=["=oops"])

@@ -226,3 +226,68 @@ class TestLeases:
     def test_lease_usage_reduces_availability(self, cap, cfg):
         decision = run_plan([make_job(1, cpu=8)], cap=cap, cfg=cfg, lease_usage={"cpu": 16, "mem_mb": 0, "gpu": 0})
         assert decision.start == []
+
+
+class TestHoldsVisibleToReservations:
+    """A reservation is a promise. Every hold the pass knows about has to feed into it,
+    or the promise is wrong and -- worse -- its backfill veto is applied to a start time
+    that means nothing."""
+
+    def test_lease_blocked_head_gets_no_eta_and_does_not_freeze_the_queue(self, cap, cfg):
+        """Nothing declares when a lease will be released, so the head job cannot be
+        promised a start time -- and a promise of "0s from now" must not veto backfill."""
+        head = make_job(1, cpu=16, max_runtime_s=600)
+        small = make_job(2, project="other", cpu=1, max_runtime_s=3600, submitted_at=NOW + 1)
+        decision = run_plan(
+            [head, small],
+            cap=cap,
+            cfg=cfg,
+            lease_usage={"cpu": 8, "mem_mb": 0, "gpu": 0, "gpu_mem_mb": 0},
+        )
+        assert decision.reservation is not None and decision.reservation.external
+        assert "lease" in decision.blocked[1]
+        assert decision.start == [2]
+
+    def test_settling_exclusive_job_counts_as_a_hold(self, cap, cfg):
+        """While a timing run sits out its settle period it owns the machine. The next
+        job's reservation has to be projected past it, not promised for right now."""
+        timing = make_job(1, exclusive=True, max_runtime_s=300, job_class=JobClass.INTERACTIVE)
+        big = make_job(2, project="other", cpu=14, max_runtime_s=600)
+        decision = run_plan([timing, big], cap=cap, cfg=cfg, last_finish_at=NOW - 2)
+        assert "settling" in decision.blocked[1]
+        assert decision.reservation is not None
+        assert decision.reservation.job_id == 2
+        assert not decision.reservation.external
+        # 8s of settle left, then up to 300s of run.
+        assert decision.reservation.start_at == NOW + 8 + 300
+
+    def test_jobs_started_this_pass_count_as_holds(self, cap, cfg):
+        first = make_job(1, cpu=12, max_runtime_s=600)
+        second = make_job(2, project="other", cpu=12, max_runtime_s=600, submitted_at=NOW + 1)
+        decision = run_plan([first, second], cap=cap, cfg=cfg)
+        assert decision.start == [1]
+        assert decision.reservation is not None
+        assert decision.reservation.start_at == NOW + 600
+
+
+class TestCountedSemaphores:
+    def test_a_named_semaphore_admits_its_configured_count(self, cap, cfg):
+        cfg.extra_semaphores = {"api:anthropic": 2}
+        jobs = [make_job(i, locks=["api:anthropic"], submitted_at=NOW + i) for i in range(1, 4)]
+        decision = run_plan(jobs, cap=cap, cfg=cfg)
+        assert decision.start == [1, 2]
+        assert "api:anthropic" in decision.blocked[3]
+
+    def test_running_holders_count_against_the_semaphore(self, cap, cfg):
+        cfg.extra_semaphores = {"api:anthropic": 2}
+        running = [
+            make_job(i, locks=["api:anthropic"], state=JobState.RUNNING, started_at=NOW, project=f"p{i}")
+            for i in (1, 2)
+        ]
+        decision = run_plan([make_job(3, locks=["api:anthropic"])], running, cap=cap, cfg=cfg)
+        assert decision.start == []
+
+    def test_an_unconfigured_lock_is_still_exclusive(self, cap, cfg):
+        jobs = [make_job(1, locks=["scratch"]), make_job(2, locks=["scratch"], submitted_at=NOW + 1)]
+        decision = run_plan(jobs, cap=cap, cfg=cfg)
+        assert decision.start == [1]

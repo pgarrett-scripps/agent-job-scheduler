@@ -26,6 +26,24 @@ queued   42  blitz       exclusive     waiting for resources; reserved to start 
 Job 42 waits for the machine to empty, waits another 10 seconds for it to go quiet, runs
 alone, and afterwards tells you whether anything else interfered.
 
+`ajs status` is a snapshot. To watch the machine, `ajs top` refreshes every second with
+capacity bars (ajs's share against load from outside it), each running job's actual CPU
+and memory next to what it declared, and what every queued job is waiting for:
+
+```
+load 4.38   disk 165.9G free
+cpu   ████████████░░░░░░░░░░░░░░░░░░  8 ajs of 20
+mem   ██████░░░░░░░░░░░░░░░░░░░░░░░░  8.0G ajs + 3.2G outside of 56.5G
+
+running (1)
+  id  project    class  cpu now/decl  mem now/decl  elapsed/max  command
+  41  koth_rust  batch       7.8/8      3.1G/8.0G     1m12s/30m   cargo test --release
+
+queued (1)
+  id  project  class  needs      waited  waiting on
+  42  blitz    batch  20cpu X    58s     waiting for resources; reserved to start by 28m from now
+```
+
 ## Install
 
 ```bash
@@ -104,7 +122,9 @@ Jobs are launched with their granted allocation in the environment:
 | `AJS_JOB_ID` | this job's id |
 | `AJS_CPU` | CPU slots granted |
 | `AJS_MEM_MB` | memory granted |
-| `AJS_EXCLUSIVE` | `1` during a timing run |
+| `AJS_GPU_MEM_MB` | VRAM granted (0 for jobs that did not ask for the GPU) |
+| `AJS_EXCLUSIVE` | `1` during a CPU timing run |
+| `AJS_GPU_EXCLUSIVE` | `1` during a GPU timing run |
 
 Use `$AJS_CPU` rather than `nproc` to size thread pools. `CPUQuota` caps a job's
 throughput but does not hide cores, so `nproc` still reports all 20 and a job that trusts
@@ -114,11 +134,23 @@ it will oversubscribe its own allocation.
 ajs submit --cpu 8 -- sh -c 'cargo test --release -j $AJS_CPU'
 ```
 
+The daemon runs as a systemd user service with a minimal environment, so the submitter's
+`PATH` and the usual toolchain variables (`VIRTUAL_ENV`, `CARGO_HOME`, `NVM_DIR`, ...) are
+forwarded with the job. Anything else goes through `--env`:
+
+```bash
+ajs submit --cpu 8 -e RAYON_NUM_THREADS=8 -e MY_TOKEN -- ./search.sh   # KEY=VALUE, or KEY to copy
+```
+
+Job records are persisted, so the whole environment is deliberately *not* forwarded.
+
 ## Scheduling
 
 - **Counted semaphores** for cpu / mem / gpu. A job declares what it needs and waits
   until that much is free.
 - **Named locks** for logical conflicts (`--lock sage-index`), independent of hardware.
+  A lock admits one holder unless `extra_semaphores` in the config gives it a count, e.g.
+  `{"api:anthropic": 3}` lets three jobs naming that lock run at once.
 - **Disk floor.** Jobs are refused admission if free space would drop below
   `disk_floor_mb`. On a nearly full disk this is what stops a job taking the desktop down
   with it.
@@ -151,10 +183,12 @@ ajs submit --cpu 8 -- sh -c 'cargo test --release -j $AJS_CPU'
 
   Two allowances keep this usable on a laptop. A desktop baseline
   (`external_cpu_allowance`, 2 cores, plus `mem_reserve_mb`) is subtracted before
-  anything is charged, and **exclusive jobs ignore foreign load entirely** — on a machine
-  that always has a browser open, a job asking for the whole machine would otherwise
-  never start. Exclusivity means no other *ajs job* runs alongside; the contention report
-  tells you what the desktop actually did.
+  anything is charged, and **exclusive jobs ignore foreign CPU and memory** — on a
+  machine that always has a browser open, a job asking for the whole machine would
+  otherwise never start. Exclusivity means no other *ajs job* runs alongside; the
+  contention report tells you what the desktop actually did. Foreign VRAM is charged to
+  everyone, timing runs included: a hand-run model holding the card is not ambient load,
+  it is an OOM waiting to happen.
 
 ## Enforcement
 

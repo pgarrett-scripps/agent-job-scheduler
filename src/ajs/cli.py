@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated, Any
 
@@ -71,11 +72,53 @@ def parse_duration(value: str) -> int:
 def parse_mem(value: str) -> int:
     """Accept 512 / 512M / 8G, returning MB."""
     value = value.strip().upper()
-    if value.endswith("G"):
-        return int(float(value[:-1]) * 1024)
-    if value.endswith("M"):
-        return int(float(value[:-1]))
+    if not value:
+        raise ValueError("empty size")
+    units = {"M": 1, "G": 1024}
+    if value[-1] in units:
+        return int(float(value[:-1]) * units[value[-1]])
+    if value[-1].isalpha():
+        raise ValueError(f"unknown size unit in {value!r}; use M or G")
     return int(float(value))
+
+
+#: Environment the submitter's shell has that the daemon's does not. The daemon runs as
+#: a systemd user service with a minimal environment, so without this a job cannot find
+#: cargo, uv, nvm-managed node or an activated virtualenv, and agents end up wrapping
+#: every command in `bash -c "export PATH=...; ..."`. Deliberately an allowlist rather
+#: than the whole environment: job records are persisted to the database, and API keys
+#: do not belong there.
+FORWARDED_ENV = (
+    "PATH",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "PYTHONPATH",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "GOPATH",
+    "NVM_DIR",
+    "JAVA_HOME",
+    "LANG",
+    "LC_ALL",
+)
+
+
+def forwarded_env(source: Mapping[str, str] | None = None, extra: list[str] | None = None) -> dict[str, str]:
+    """Build the environment a job inherits from its submitter.
+
+    ``extra`` entries are ``KEY=VALUE`` or bare ``KEY`` (copied from ``source``).
+    """
+    src: Mapping[str, str] = os.environ if source is None else source
+    env = {k: src[k] for k in FORWARDED_ENV if k in src}
+    for item in extra or []:
+        key, sep, value = item.partition("=")
+        if not key:
+            raise ValueError(f"bad --env entry: {item!r}")
+        if sep:
+            env[key] = value
+        elif key in src:
+            env[key] = src[key]
+    return env
 
 
 def _client() -> Client:
@@ -113,6 +156,10 @@ def submit(
     job_class: Annotated[str, typer.Option("--class", help="interactive | batch | background")] = "batch",
     project: Annotated[str | None, typer.Option("--project", "-p", help="Defaults to the git repo name.")] = None,
     session: Annotated[str, typer.Option("--session", help="Opaque submitter id.")] = "",
+    env: Annotated[
+        list[str] | None,
+        typer.Option("--env", "-e", help="Extra environment for the job: KEY=VALUE, or KEY to copy from your shell."),
+    ] = None,
     wait: Annotated[bool, typer.Option("--wait", "-w", help="Block until the job finishes.")] = False,
     json_out: Annotated[bool, typer.Option("--json", help="Emit JSON instead of prose.")] = False,
 ) -> None:
@@ -124,6 +171,14 @@ def submit(
     if not cmd:
         _fail("no command given. Put it after `--`, e.g. ajs submit --cpu 4 -- pytest tests")
 
+    try:
+        job_env = forwarded_env(extra=env)
+        mem_mb, gpu_mem_mb, disk_mb = parse_mem(mem), parse_mem(gpu_mem), parse_mem(disk)
+        max_runtime_s = parse_duration(max_runtime)
+    except ValueError as exc:
+        _fail(str(exc))
+        return
+
     client = _client()
     try:
         job = client.submit(
@@ -131,15 +186,16 @@ def submit(
             session_id=session or os.environ.get("AJS_SESSION", ""),
             cmd=cmd,
             cwd=str(Path.cwd()),
+            env=job_env,
             cpu=cpu,
-            mem_mb=parse_mem(mem),
+            mem_mb=mem_mb,
             gpu=gpu,
-            gpu_mem_mb=parse_mem(gpu_mem),
-            disk_mb=parse_mem(disk),
+            gpu_mem_mb=gpu_mem_mb,
+            disk_mb=disk_mb,
             exclusive=exclusive,
             gpu_exclusive=gpu_exclusive,
             locks=list(lock or []),
-            max_runtime_s=parse_duration(max_runtime),
+            max_runtime_s=max_runtime_s,
             job_class=job_class,
         )
     except protocol.SchedulerError as exc:
@@ -354,6 +410,41 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
 
     if not data["running"] and not data["queued"]:
         console.print("[dim]idle[/dim]")
+
+
+@app.command(name="top")
+def top_cmd(
+    interval: Annotated[float, typer.Option("--interval", "-i", help="Seconds between refreshes.")] = 1.0,
+    once: Annotated[bool, typer.Option("--once", help="Print one frame and exit.")] = False,
+) -> None:
+    """Live view: capacity bars, running jobs with actual vs declared usage, and the queue."""
+    from rich.live import Live
+    from rich.text import Text
+
+    from .top import render
+
+    client = _client()
+    try:
+        data = client.status()
+    except protocol.SchedulerError as exc:
+        _fail(str(exc))
+        return
+    if once:
+        console.print(render(data))
+        return
+
+    try:
+        with Live(render(data), console=console, screen=True, refresh_per_second=4) as live:
+            while True:
+                time.sleep(max(0.2, interval))
+                try:
+                    data = client.status()
+                except protocol.SchedulerError as exc:
+                    live.update(Text(f"error: {exc}\n(retrying)", style="red"))
+                    continue
+                live.update(render(data))
+    except KeyboardInterrupt:
+        return
 
 
 @app.command(name="ps")

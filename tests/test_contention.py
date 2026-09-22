@@ -146,3 +146,37 @@ class TestVerdictScope:
         report = self._monitor(monkeypatch, assess=True, elapsed=0.04, foreign=0.6)
         assert not report.contended
         assert "too short" in report.note
+
+
+class TestVanishingCgroup:
+    """systemd removes a scope's cgroup the instant its last process exits, which is also
+    when the daemon finds out. The verdict must survive that, or every job on a systemd
+    host reports 'accounting unavailable'."""
+
+    def test_falls_back_to_the_last_polled_sample(self, monkeypatch):
+        monitor = ContentionMonitor(threshold_cores=2.0)
+        monkeypatch.setattr(contention, "system_busy_seconds", lambda: 1000.0)
+        monkeypatch.setattr(contention, "cgroup_cpu_seconds", lambda p: 100.0)
+        monkeypatch.setattr(contention, "cgroup_mem_bytes", lambda p: 0)
+        monitor.start(pid=None, now=0.0, cgroup=contention.Path("/fake"))
+
+        monkeypatch.setattr(contention, "cgroup_cpu_seconds", lambda p: 109.0)
+        monitor.poll(now=9.0)
+
+        # Job exits; cgroup gone; system did 10 CPU-s, job accounted for 9 of them.
+        monkeypatch.setattr(contention, "cgroup_cpu_seconds", lambda p: None)
+        monkeypatch.setattr(contention, "system_busy_seconds", lambda: 1010.0)
+        report = monitor.finish(now=10.0)
+
+        assert report.foreign_cpu_seconds == 1.0
+        assert not report.contended
+        assert "last sampled 1.0s before exit" in report.note
+
+    def test_without_any_sample_the_verdict_is_unknown(self, monkeypatch):
+        monitor = ContentionMonitor(threshold_cores=2.0)
+        monkeypatch.setattr(contention, "system_busy_seconds", lambda: 1000.0)
+        monkeypatch.setattr(contention, "cgroup_cpu_seconds", lambda p: None)
+        monitor.start(pid=None, now=0.0, cgroup=contention.Path("/fake"))
+        report = monitor.finish(now=10.0)
+        assert report.foreign_cores is None
+        assert "unknown" in report.note

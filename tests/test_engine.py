@@ -1,6 +1,7 @@
 """End-to-end: the engine really launches processes and reaps them."""
 
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -243,3 +244,28 @@ class TestLeases:
         expired = engine.store.expire_leases(time.time() + 1)
         assert lease in expired
         assert engine.status()["free"]["cpu"] == 4
+
+
+class TestExternalSampling:
+    async def test_a_shared_cgroup_is_counted_once(self, engine, monkeypatch):
+        """Without systemd every job lives in the daemon's own cgroup. Summing that per
+        job would multiply ajs's share by the job count and hide real foreign load."""
+        from ajs.contention import ContentionMonitor
+
+        engine.cfg.track_external_load = True
+        shared = Path("/sys/fs/cgroup/shared")
+        for job_id in (1, 2, 3):
+            monitor = ContentionMonitor(2.0)
+            monitor._cgroup = shared
+            engine.monitors[job_id] = monitor
+        monkeypatch.setattr(ContentionMonitor, "current_cpu_seconds", lambda self: 100.0)
+        monkeypatch.setattr(ContentionMonitor, "current_mem_bytes", lambda self: 1024 * 1024 * 100)
+
+        seen = {}
+
+        def fake_sample(now, own_cpu, own_mem, own_cgroups=None):
+            seen.update(cpu=own_cpu, mem=own_mem, cgroups=own_cgroups)
+
+        monkeypatch.setattr(engine.external, "sample", fake_sample)
+        engine._sample_external(now=0.0)
+        assert seen == {"cpu": 100.0, "mem": 100, "cgroups": {shared}}

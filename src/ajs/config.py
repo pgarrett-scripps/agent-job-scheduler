@@ -60,6 +60,16 @@ def socket_path() -> Path:
     return short / "ajsd.sock"
 
 
+def instance_tag() -> str:
+    """Short identifier for this daemon instance, derived from its state directory.
+
+    Job scopes are named with it, so two daemons on one machine (say, the real one and
+    a throwaway under a scratch AJS_STATE_DIR) cannot mistake each other's jobs for
+    orphans and stop them on startup.
+    """
+    return hashlib.sha256(str(state_dir()).encode()).hexdigest()[:6]
+
+
 def db_path() -> Path:
     return state_dir() / "jobs.db"
 

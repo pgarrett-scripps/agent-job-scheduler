@@ -161,13 +161,6 @@ class Store:
         rows = self.conn.execute(f"SELECT * FROM jobs {where} ORDER BY id DESC LIMIT ?", tuple(args)).fetchall()
         return [_row_to_job(r) for r in rows]
 
-    def running_count_for_project(self, project: str) -> int:
-        row = self.conn.execute(
-            "SELECT COUNT(*) AS n FROM jobs WHERE project=? AND state=?",
-            (project, str(JobState.RUNNING)),
-        ).fetchone()
-        return int(row["n"])
-
     # --- fair share -------------------------------------------------------
 
     def note_project_start(self, project: str, when: float) -> None:

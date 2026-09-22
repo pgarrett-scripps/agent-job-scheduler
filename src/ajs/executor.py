@@ -14,14 +14,22 @@ import logging
 import os
 import signal
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from .config import Config
+from . import sysinfo
+from .config import Config, instance_tag
+from .contention import cgroup_path_for_pid
 from .models import Job
 
 log = logging.getLogger("ajs.executor")
+
+#: How long to wait for systemd to move a freshly spawned job into its scope. On this
+#: hardware it takes ~60 ms; the ceiling is generous because guessing wrong is worse
+#: than a short delay (see ``_await_cgroup``).
+CGROUP_SETTLE_TIMEOUT_S = 3.0
 
 
 @dataclass(slots=True)
@@ -33,23 +41,33 @@ class RunningProcess:
     unit: str | None
     log_path: Path
     log_file: IO[bytes]
+    cgroup: Path | None = None
+    """The cgroup the job actually runs in, resolved once systemd has moved it there.
+    None means unknown, and callers must treat unknown as "cannot account for this job"
+    rather than as "uses nothing"."""
 
 
 class Executor:
     """Starts jobs and reaps them."""
 
-    def __init__(self, cfg: Config, log_dir: Path, *, use_systemd: bool | None = None) -> None:
+    def __init__(self, cfg: Config, log_dir: Path, *, use_systemd: bool | None = None, tag: str | None = None) -> None:
         self.cfg = cfg
         self.log_dir = log_dir
         self.log_dir.mkdir(parents=True, exist_ok=True)
-        self._systemd = cfg.use_systemd if use_systemd is None else use_systemd
+        self.tag = tag if tag is not None else instance_tag()
+        self.unit_prefix = f"ajs-{self.tag}-job-"
+        if use_systemd is None:
+            use_systemd = cfg.use_systemd and sysinfo.has_systemd_run()
+            if cfg.use_systemd and not use_systemd:
+                log.warning("systemd-run is unavailable; jobs will run in plain process groups without limits")
+        self._systemd = use_systemd
 
     def _wrap(self, job: Job, need: dict[str, int]) -> tuple[list[str], str | None]:
         """Build the argv that actually gets executed, plus the cgroup unit name."""
         if not self._systemd:
             return list(job.cmd), None
 
-        unit = f"ajs-job-{job.id}"
+        unit = f"{self.unit_prefix}{job.id}"
         argv = [
             "systemd-run",
             "--user",
@@ -110,12 +128,44 @@ class Executor:
             log_file.close()
             raise
 
-        return RunningProcess(job_id=job.id, proc=proc, unit=unit, log_path=log_path, log_file=log_file)
+        rp = RunningProcess(job_id=job.id, proc=proc, unit=unit, log_path=log_path, log_file=log_file)
+        rp.cgroup = await self._await_cgroup(rp)
+        return rp
+
+    @staticmethod
+    async def _await_cgroup(rp: RunningProcess) -> Path | None:
+        """Resolve the cgroup the job runs in.
+
+        ``systemd-run --scope`` registers the scope and only *then* moves itself into it,
+        tens of milliseconds after we get the PID back. Reading ``/proc/<pid>/cgroup``
+        immediately returns the daemon's own cgroup, and a monitor pointed at that
+        attributes the job's every CPU-second to "someone else": timing runs get stamped
+        contended by their own work, and the foreign-load tracker charges each running
+        job against free capacity a second time. So poll until the PID is in a cgroup
+        named after its unit.
+        """
+        if rp.unit is None:
+            return cgroup_path_for_pid(rp.proc.pid)
+        deadline = time.monotonic() + CGROUP_SETTLE_TIMEOUT_S
+        while True:
+            path = cgroup_path_for_pid(rp.proc.pid)
+            if path is not None and path.name == rp.unit:
+                return path
+            if rp.proc.returncode is not None or time.monotonic() >= deadline:
+                # Exited before the move completed, or systemd never delivered. Better
+                # to report "unknown" than to measure the wrong cgroup as if it were ours.
+                if rp.proc.returncode is None:
+                    log.warning("job %s: cgroup did not appear within %.1fs", rp.job_id, CGROUP_SETTLE_TIMEOUT_S)
+                return None
+            await asyncio.sleep(0.01)
 
     async def stop(self, rp: RunningProcess, *, grace_s: float = 10.0) -> None:
         """Terminate a job and everything it spawned, escalating to SIGKILL."""
         if rp.unit:
-            await self._systemctl("stop", rp.unit)
+            # --no-block: a plain `systemctl stop` waits for the unit to go down, up to
+            # systemd's stop timeout, and this is awaited from the scheduler tick. The
+            # grace period and SIGKILL escalation below are our own.
+            await self._systemctl("stop", "--no-block", rp.unit)
         else:
             self._signal_group(rp, signal.SIGTERM)
 
@@ -145,16 +195,18 @@ class Executor:
             )
             await proc.wait()
 
-    @staticmethod
-    def orphan_units() -> list[str]:
-        """Job scopes left behind by a previous daemon life.
+    def orphan_units(self) -> list[str]:
+        """Job scopes left behind by a previous life of *this* daemon.
 
         The daemon reconciles against these on startup so a crash does not leak cgroups
-        that still hold real resources the scheduler has forgotten about.
+        that still hold real resources the scheduler has forgotten about. Matched by
+        this instance's tag: another daemon's jobs are not orphans, they are its jobs.
         """
+        if not self._systemd:
+            return []
         try:
             out = subprocess.run(
-                ["systemctl", "--user", "list-units", "--all", "--no-legend", "--plain", "ajs-job-*.scope"],
+                ["systemctl", "--user", "list-units", "--all", "--no-legend", "--plain", f"{self.unit_prefix}*.scope"],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -165,7 +217,7 @@ class Executor:
         units = []
         for line in out.stdout.splitlines():
             parts = line.split()
-            if parts and parts[0].startswith("ajs-job-"):
+            if parts and parts[0].startswith(self.unit_prefix):
                 units.append(parts[0])
         return units
 

@@ -115,14 +115,27 @@ class ContentionMonitor:
         self._cgroup: Path | None = None
         self._cgroup_start: float | None = None
         self._t_start: float = 0.0
+        self._last_cpu: float | None = None
+        self._last_cpu_at: float | None = None
+        self.cpu_cores_now: float | None = None
+        """Cores the job used over the most recent tick, for `ajs top`."""
+        self.mem_now_mb: int | None = None
 
-    def start(self, pid: int | None, now: float) -> None:
+    def start(self, pid: int | None, now: float, *, cgroup: Path | None = None) -> None:
+        """Take the opening samples.
+
+        Prefer an explicit ``cgroup`` from the executor, which has waited for systemd to
+        finish moving the job into its scope. Resolving by PID here is only right once
+        that move is complete; before it, the PID still sits in the daemon's own cgroup.
+        """
         self._t_start = now
         self._busy_start = system_busy_seconds()
-        if pid is not None:
-            self._cgroup = cgroup_path_for_pid(pid)
-            if self._cgroup is not None:
-                self._cgroup_start = cgroup_cpu_seconds(self._cgroup)
+        if cgroup is None and pid is not None:
+            cgroup = cgroup_path_for_pid(pid)
+        self._cgroup = cgroup
+        if self._cgroup is not None:
+            self._cgroup_start = cgroup_cpu_seconds(self._cgroup)
+            self._last_cpu, self._last_cpu_at = self._cgroup_start, now
 
     @property
     def cgroup(self) -> Path | None:
@@ -137,6 +150,23 @@ class ContentionMonitor:
         """Memory this job is using right now, or None if unaccounted."""
         return cgroup_mem_bytes(self._cgroup) if self._cgroup is not None else None
 
+    def poll(self, now: float) -> tuple[float | None, int | None]:
+        """Read the job's counters and remember the CPU figure.
+
+        systemd removes a scope's cgroup as soon as its last process exits, which is
+        also the moment the daemon learns the job is done -- by then ``cpu.stat`` is
+        gone. The verdict therefore falls back on the most recent reading taken here,
+        and the tick period bounds how much of the job's own work goes unattributed.
+        """
+        cpu = self.current_cpu_seconds()
+        if cpu is not None:
+            if self._last_cpu is not None and self._last_cpu_at is not None and now > self._last_cpu_at:
+                self.cpu_cores_now = max(0.0, (cpu - self._last_cpu) / (now - self._last_cpu_at))
+            self._last_cpu, self._last_cpu_at = cpu, now
+        mem = self.current_mem_bytes()
+        self.mem_now_mb = mem // (1024 * 1024) if mem is not None else None
+        return cpu, mem
+
     def finish(self, now: float) -> ContentionReport:
         elapsed = max(now - self._t_start, 1e-6)
         busy_end = system_busy_seconds()
@@ -148,8 +178,12 @@ class ContentionMonitor:
 
         own = 0.0
         measured_own = False
+        stale_by = 0.0
         if self._cgroup is not None and self._cgroup_start is not None:
             end = cgroup_cpu_seconds(self._cgroup)
+            if end is None and self._last_cpu is not None and self._last_cpu_at is not None:
+                # The cgroup is already gone; use the last sample the tick loop took.
+                end, stale_by = self._last_cpu, max(0.0, now - self._last_cpu_at)
             if end is not None:
                 own = max(0.0, end - self._cgroup_start)
                 measured_own = True
@@ -177,6 +211,8 @@ class ContentionMonitor:
             f"({foreign:.1f} CPU-s not attributable to this job; "
             f"threshold {self.threshold:.2f})"
         )
+        if stale_by > 0.5:
+            note += f"; job cpu last sampled {stale_by:.1f}s before exit"
         return ContentionReport(foreign, elapsed, cores, contended, note)
 
 

@@ -64,7 +64,7 @@ class Engine:
                 exit_code=None,
                 cancel_reason="daemon restarted while job was running",
             )
-        for unit in Executor.orphan_units():
+        for unit in self.executor.orphan_units():
             log.warning("stopping orphaned unit %s", unit)
             await Executor.stop_unit(unit)
 
@@ -146,22 +146,28 @@ class Engine:
 
         Summing the live job cgroups gives ajs's own share; whatever else the kernel
         counts as busy belongs to somebody else.
+
+        Each cgroup is counted once. Without systemd every job shares the daemon's own
+        cgroup, and summing it per job would multiply ajs's share by the job count.
+
+        Monitors are polled even when external-load tracking is off: a job's cgroup is
+        removed the moment it exits, so the last reading taken here is what the
+        contention verdict falls back on.
         """
-        if not self.cfg.track_external_load:
-            return
         own_cpu = 0.0
         own_mem = 0
-        own_cgroups = set()
+        own_cgroups: set[Path] = set()
         for monitor in self.monitors.values():
-            cpu = monitor.current_cpu_seconds()
+            cpu, mem = monitor.poll(now)
+            if monitor.cgroup is None or monitor.cgroup in own_cgroups:
+                continue
+            own_cgroups.add(monitor.cgroup)
             if cpu is not None:
                 own_cpu += cpu
-            mem = monitor.current_mem_bytes()
             if mem is not None:
                 own_mem += mem // (1024 * 1024)
-            if monitor.cgroup is not None:
-                own_cgroups.add(monitor.cgroup)
-        self.external.sample(now, own_cpu, own_mem, own_cgroups)
+        if self.cfg.track_external_load:
+            self.external.sample(now, own_cpu, own_mem, own_cgroups)
 
     def _external_usage(self) -> dict[str, int] | None:
         if not self.cfg.track_external_load:
@@ -231,7 +237,7 @@ class Engine:
             self.cfg.contention_threshold,
             assess=job.resources.exclusive or job.resources.gpu_exclusive,
         )
-        monitor.start(rp.proc.pid, now)
+        monitor.start(rp.proc.pid, now, cgroup=rp.cgroup)
         self.monitors[job.id] = monitor
         self.running[job.id] = rp
 
@@ -247,12 +253,13 @@ class Engine:
         )
         self.store.note_project_start(job.project, now)
         log.info(
-            "started job %s (%s) cpu=%s mem=%sMB%s",
+            "started job %s (%s) cpu=%s mem=%sMB%s cgroup=%s",
             job.id,
             job.project,
             need["cpu"],
             need["mem_mb"],
             " EXCLUSIVE" if job.resources.exclusive else "",
+            rp.cgroup.name if rp.cgroup is not None else "unknown",
         )
 
         task = asyncio.create_task(self._supervise(job.id, rp))
@@ -412,7 +419,7 @@ class Engine:
             # subtracted here too -- reporting it as free is the very confusion this
             # measurement exists to remove.
             "free": {k: max(0, cap[k] - used[k] - external.get(k, 0)) for k in used},
-            "running": [j.to_dict() for j in running],
+            "running": [self._with_usage(j) for j in running],
             "queued": [{**j.to_dict(), "blocked_reason": self.blocked_reason(j.id)} for j in queued],
             "reservation": (
                 {
@@ -431,6 +438,15 @@ class Engine:
             "load": sysinfo.load_average(),
             "active_leases": len(self.store.active_leases()),
         }
+
+    def _with_usage(self, job: Job) -> dict[str, Any]:
+        """A running job's record plus what its cgroup is actually consuming right now,
+        so declared and real usage can be shown side by side."""
+        data = job.to_dict()
+        monitor = self.monitors.get(job.id)
+        data["cpu_now"] = None if monitor is None else monitor.cpu_cores_now
+        data["mem_now_mb"] = None if monitor is None else monitor.mem_now_mb
+        return data
 
     # --- leases -----------------------------------------------------------
 

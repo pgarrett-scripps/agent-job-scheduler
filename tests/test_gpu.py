@@ -154,3 +154,22 @@ def test_a_gpu_request_on_a_gpuless_machine_is_impossible_not_silent(cfg):
 @pytest.mark.parametrize("declared", [0, 1024, 4096])
 def test_effective_request_never_returns_negative_vram(cap, declared):
     assert effective_request(make_job(1, gpu_mem_mb=declared), cap)["gpu_mem_mb"] >= 0
+
+
+def test_more_vram_than_the_card_has_is_impossible_not_a_wait(cfg, cap):
+    """Without VRAM in the impossibility check this job sat in the queue forever,
+    reported as waiting on load outside ajs that did not exist."""
+    decision = plan(queued=[make_job(1, gpu=1, gpu_mem_mb=8192)], running=[], cap=cap, cfg=cfg, now=NOW, last_start={})
+    assert decision.start == []
+    assert decision.reservation is None
+    assert decision.blocked[1].startswith("impossible")
+
+
+def test_a_vram_figure_on_a_gpuless_machine_is_impossible(cfg):
+    """Declaring VRAM zeroes the device count in the request, so this case used to
+    slip past the `gpu > cap.gpu` check."""
+    nogpu = Capacity(cpu=20, mem_mb=56000, gpu=0, gpu_mem_mb=0)
+    decision = plan(
+        queued=[make_job(1, gpu=1, gpu_mem_mb=1024)], running=[], cap=nogpu, cfg=cfg, now=NOW, last_start={}
+    )
+    assert decision.blocked[1].startswith("impossible")

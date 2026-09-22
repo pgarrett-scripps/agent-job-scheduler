@@ -148,21 +148,29 @@ to the whole machine. Two properties are deliberate:
 - **It is reported as usage, never as reduced capacity.** Shrinking `cap` would make a
   20-core exclusive job *impossible* the moment a browser opened. Treating foreign work as
   usage makes it wait instead.
-- **Exclusive jobs are exempt from it.** This machine is a laptop and always has a desktop
-  session on it. An exclusive job asks for the entire machine, so charging foreign load
-  against it too means the request exceeds what is free *by definition, forever* — the
-  timing run simply never starts. What exclusivity can honestly guarantee here is that no
-  other **ajs job** runs alongside; whether the desktop interfered is then measured and
-  reported by the contention monitor rather than pretended away in advance. Exclusive
-  jobs still wait for other ajs jobs.
+- **Exclusive jobs are exempt from foreign CPU and memory.** This machine is a laptop and
+  always has a desktop session on it. An exclusive job asks for the entire machine, so
+  charging foreign load against it too means the request exceeds what is free *by
+  definition, forever* — the timing run simply never starts. What exclusivity can honestly
+  guarantee here is that no other **ajs job** runs alongside; whether the desktop
+  interfered is then measured and reported by the contention monitor rather than pretended
+  away in advance. Exclusive jobs still wait for other ajs jobs, and the exemption applies
+  when *projecting* their start time too — otherwise the reservation comes back with no
+  ETA, the backfill veto is dropped, and the timing run is starved by small jobs.
+- **Foreign VRAM is charged to everyone.** The display reserve already covers the
+  compositor. Anything else on the card is a compute process, and admitting a job — or a
+  GPU timing run — on top of it means an OOM, not a slightly noisy measurement.
 - **A desktop allowance is subtracted first.** `external_cpu_allowance` (2 cores) and
   `mem_reserve_mb` are deducted from the measurement before anything is charged. The
   memory one also fixes a double-count: capacity is already `total − mem_reserve_mb`, so
   billing the desktop's measured usage on top charged it twice.
-- **A job blocked only by foreign load gets no reservation promise.** Reservations bound a
-  wait by projecting running jobs' `max_runtime`; nothing declares when a browser closes.
-  Such a reservation is flagged `external` and does not veto backfill — holding cores empty
-  for a start time we cannot predict would strand small jobs for nothing.
+- **A job blocked only by foreign load (or a lease) gets no reservation promise.**
+  Reservations bound a wait by projecting the release time of every hold the scheduler
+  knows about: running jobs at their `max_runtime`, jobs started earlier in the same
+  pass, and an exclusive job parked in its settle period. Nothing declares when a browser
+  closes or a lease is released. Such a reservation is flagged `external` and does not
+  veto backfill — holding cores empty for a start time we cannot predict would strand
+  small jobs for nothing.
 
 CPU is smoothed (15 s half-life) because a one-second sample is spiky enough that a single
 compile would evict a queued job. Memory is not: it is a level rather than a rate, and
@@ -189,12 +197,23 @@ Three small additions on top, and only three:
 
 1. **Settle delay.** After the last job exits, wait `settle_seconds` (default 10) before starting —
    page cache writeback and dying processes are still perturbing things.
-2. **Contamination stamp.** Sample `/proc/loadavg` (and optionally cgroup CPU pressure) immediately
-   before and after. If load exceeded a threshold, stamp the record `contended: true`. The number
-   still gets recorded — you just know not to publish it. `ajs ps --all` marks such runs
-   `!contended`. **This is the part that protects you from silently wrong benchmarks.**
-3. **Foreign-load warning.** The daemon only knows about *its* jobs. If a browser or a stray
-   terminal is eating cores, warn at submit time and stamp the record.
+2. **Contamination stamp.** Difference two counters over the run: system-wide busy CPU time
+   from `/proc/stat`, and the job's own cgroup CPU time. What is left is *foreign* CPU — work
+   done by something the scheduler did not start — and if it averaged more than
+   `contention_threshold` cores the record is stamped `contended: true`. The number still gets
+   recorded — you just know not to publish it. `ajs ps --all` marks such runs `!contended`.
+   **This is the part that protects you from silently wrong benchmarks.** Sampling load
+   average before and after does *not* work, because at the end of a run the load is
+   dominated by the job itself.
+
+   One subtlety: `systemd-run --scope` hands back a PID before systemd has moved it into
+   its scope, so reading `/proc/<pid>/cgroup` immediately returns the daemon's own cgroup.
+   A monitor pointed at that attributes every CPU-second the job burns to "someone else",
+   and stamps the run contended by its own work. The executor waits for the PID to land in
+   a cgroup named after its unit before anything is measured.
+3. **Foreign-load accounting.** The same subtraction, run continuously over the whole machine,
+   is what the scheduler uses to stop admitting jobs onto cores something else already holds
+   (see *Foreign load* above).
 
 ### Starvation, and why `max_runtime` is mandatory
 
@@ -241,7 +260,9 @@ through `ajs`. That's phase 2 — try trust first, it's usually enough and far l
 ## Failure and recovery
 
 - **Daemon restart:** on boot, reconcile — scan for orphaned cgroups/PIDs from the previous life,
-  adopt or reap them, rebuild the available-resource counts from what's actually running.
+  adopt or reap them, rebuild the available-resource counts from what's actually running. Job
+  scopes are named `ajs-<tag>-job-<id>`, where the tag is derived from the state directory, so
+  a second daemon (a throwaway under a scratch `AJS_STATE_DIR`, say) only ever reaps its own.
 - **Dead agent:** its *jobs* keep running (they're the daemon's children, not the agent's) and
   results are retrievable later by job id. Its *leases* expire on heartbeat timeout.
 - **Disk guard:** with 18 GB free, a job that writes a large search output can fill the root
@@ -281,9 +302,9 @@ Phase 0 + 1 is the real core; 2 is what makes it disappear into your workflow.
 
 ## Status
 
-Phases 0-4 are implemented and tested (86 tests). Not built: a live-updating `ajs top`
-TUI (`ajs status` is a snapshot instead), and learned per-command resource defaults --
-see below.
+Phases 0-4 are implemented and tested. `ajs top` is the live view; `ajs status` stays a
+snapshot for scripts and agents. Not built: learned per-command resource defaults -- see
+below.
 
 ## Open questions
 
