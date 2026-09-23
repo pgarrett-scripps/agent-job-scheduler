@@ -50,6 +50,7 @@ class Engine:
         """Timing jobs -> interference seen while they ran, one line per episode."""
         self._interfering: set[int] = set()
         self._timing: set[int] = set()
+        self._mem_warned: set[int] = set()
         """Running exclusive (CPU) jobs; a GPU-exclusive run is not spoiled by CPU load."""
         self._own_cgroups: set[Path] = set()
         self.paused = False
@@ -162,6 +163,7 @@ class Engine:
     async def tick(self) -> None:
         now = time.time()
         self._sample_external(now)
+        self._warn_mem_underuse(now)
 
         expired = self.store.expire_leases(now - self.cfg.lease_timeout_s)
         for lease_id in expired:
@@ -372,6 +374,46 @@ class Engine:
                     self._tasks.add(task)
                     task.add_done_callback(self._tasks.discard)
 
+    def _warn_mem_underuse(self, now: float) -> None:
+        for job in self.store.jobs_in_state(JobState.RUNNING):
+            monitor = self.monitors.get(job.id)
+            if monitor is not None:
+                self._check_mem_underuse(job, monitor, now, final=False)
+
+    def _check_mem_underuse(self, job: Job, monitor: ContentionMonitor, now: float, *, final: bool) -> None:
+        """Tell the owner, once, when a job holds far more memory than it ever uses.
+
+        The event lands in the owner's `ajs inbox`. Judged on the job's peak, not its
+        current use, so a job between phases is not flagged; judged at the job's
+        ``mem_check`` age, or at its end if it finishes sooner."""
+        reserved = job.resources.mem_mb
+        peak = monitor.mem_peak_mb
+        if job.started_at is None or peak is None or reserved < self.cfg.mem_underuse_min_mb:
+            return
+        after = mem_check_after(job.meta.get("mem_check"), self.cfg.mem_underuse_after_s)
+        if after is None or (not final and now - job.started_at < after):
+            return
+        if peak >= reserved * self.cfg.mem_underuse_ratio:
+            return
+        if job.id in self._mem_warned:
+            return
+        self._mem_warned.add(job.id)
+        if self.store.last_event(job.id, "mem-underuse") is not None:
+            return  # warned before a daemon restart
+        suggest_gb = max(1, -(-int(peak * 1.25) // 1024))
+        minutes = (now - job.started_at) / 60
+        self.store.add_event(
+            job.id,
+            actor="ajs",
+            action="mem-underuse",
+            detail=f"peak {peak / 1024:.1f} of {reserved / 1024:.0f} GB reserved after {minutes:.0f} min",
+            reason=(
+                f"reserve about {suggest_gb}G next time; the unused reservation keeps other jobs "
+                "queued (move this check with --meta mem_check=20m, or =off)"
+            ),
+        )
+        log.info("job %s uses %s of %s MB reserved", job.id, peak, reserved)
+
     def _enforce_disk_floor(self) -> None:
         free = sysinfo.free_disk_mb(self.cfg.disk_watch_path)
         if free >= self.cfg.disk_floor_mb:
@@ -464,6 +506,8 @@ class Engine:
             "load_after": sysinfo.load_average()[0],
         }
 
+        if monitor is not None and job is not None:
+            self._check_mem_underuse(job, monitor, now, final=True)
         if monitor is not None:
             report = monitor.finish(now)
             fields["contended"] = 1 if report.contended else 0
@@ -479,6 +523,7 @@ class Engine:
         self.interference.pop(job_id, None)
         self._interfering.discard(job_id)
         self._timing.discard(job_id)
+        self._mem_warned.discard(job_id)
 
         if job is not None and job.cancel_reason and "max_runtime" in job.cancel_reason:
             fields["state"] = str(JobState.TIMEOUT)
@@ -840,3 +885,22 @@ def _clock(ts: float | None) -> str:
         return "-"
     fmt = "%H:%M" if time.localtime(ts)[:3] == time.localtime()[:3] else "%a %d %b %H:%M"
     return time.strftime(fmt, time.localtime(ts))
+
+
+def mem_check_after(value: str | None, default_s: int) -> int | None:
+    """Seconds into a run to judge its memory use, from ``--meta mem_check``.
+
+    ``off`` disables the check; anything unreadable falls back to the default rather
+    than failing a job over a typo in its metadata."""
+    if value is None:
+        return default_s
+    value = value.strip().lower()
+    if value in ("off", "no", "false", "0"):
+        return None
+    units = {"s": 1, "m": 60, "h": 3600}
+    try:
+        if value and value[-1] in units:
+            return int(float(value[:-1]) * units[value[-1]])
+        return int(float(value))
+    except ValueError:
+        return default_s

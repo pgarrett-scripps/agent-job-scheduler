@@ -79,7 +79,11 @@ explicitly asked you to in this conversation. Cancelling your own job stays fine
 
 When you do queue something, declare `cpu` and `mem` honestly. The scheduler hands out
 slots based on what you claim, so under-declaring causes the overloading this exists to
-prevent.
+prevent. Over-declaring wastes it the other way: memory you reserve and never touch
+keeps other jobs queued on an idle machine. If a job's peak stays under a quarter of a
+large reservation, ajs tells you in your inbox after 5 minutes (or at the end); size the
+next submission from that. A job that loads slowly can move the check with
+meta `mem_check=20m`, or turn it off with `mem_check=off`.
 """
 
 

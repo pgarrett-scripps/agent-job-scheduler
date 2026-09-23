@@ -105,6 +105,14 @@ def cgroup_mem_bytes(path: Path) -> int | None:
         return None
 
 
+def cgroup_mem_peak_bytes(path: Path) -> int | None:
+    """Most memory ever charged to ``path`` (cgroup v2 ``memory.peak``, Linux 5.19+)."""
+    try:
+        return int((path / "memory.peak").read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
 @dataclass(slots=True)
 class ContentionReport:
     """What else was happening while the job ran."""
@@ -142,6 +150,8 @@ class ContentionMonitor:
         self.cpu_cores_now: float | None = None
         """Cores the job used over the most recent tick, for `ajs top`."""
         self.mem_now_mb: int | None = None
+        self.mem_peak_mb: int | None = None
+        """Most memory the job has held, for telling owners they reserved too much."""
 
     def start(self, pid: int | None, now: float, *, cgroup: Path | None = None) -> None:
         """Take the opening samples.
@@ -187,6 +197,12 @@ class ContentionMonitor:
             self._last_cpu, self._last_cpu_at = cpu, now
         mem = self.current_mem_bytes()
         self.mem_now_mb = mem // (1024 * 1024) if mem is not None else None
+        # The kernel's own high-water mark catches spikes between ticks; older kernels
+        # lack it, and then the largest sampled value has to do.
+        peak = cgroup_mem_peak_bytes(self._cgroup) if self._cgroup is not None else None
+        for value in (peak // (1024 * 1024) if peak is not None else None, self.mem_now_mb):
+            if value is not None and (self.mem_peak_mb is None or value > self.mem_peak_mb):
+                self.mem_peak_mb = value
         return cpu, mem
 
     def finish(self, now: float) -> ContentionReport:

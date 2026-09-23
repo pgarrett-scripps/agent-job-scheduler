@@ -545,3 +545,49 @@ def test_old_database_gains_new_columns(tmp_path):
     [job] = store.jobs_in_state(JobState.QUEUED)
     assert job.held is False and job.title is None and job.description is None and job.meta == {}
     store.close()
+
+
+class TestMemUnderuse:
+    """Owners hear, once, when a job reserves far more memory than it ever uses."""
+
+    def _job(self, engine, peak_mb, *, age_s, meta=None):
+        from ajs.contention import ContentionMonitor
+
+        engine.cfg.mem_underuse_min_mb = 1000
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", mem_mb=4000, meta=meta)
+        engine.store.update_job(job.id, started_at=time.time() - age_s)
+        monitor = ContentionMonitor(2.0)
+        monitor.mem_peak_mb = peak_mb
+        return engine.store.get_job(job.id), monitor
+
+    def _warnings(self, engine, job_id):
+        return [e for e in engine.store.events(job_id=job_id) if e["action"] == "mem-underuse"]
+
+    def test_warns_once_after_the_check_age(self, engine):
+        job, monitor = self._job(engine, 500, age_s=600)
+        engine._check_mem_underuse(job, monitor, time.time(), final=False)
+        engine._check_mem_underuse(job, monitor, time.time(), final=False)
+        (event,) = self._warnings(engine, job.id)
+        assert event["detail"].startswith("peak 0.5 of 4 GB reserved")
+        assert "reserve about 1G" in event["reason"]
+        assert engine.store.session_events("s", since=0)  # reaches the owner's inbox
+
+    def test_waits_for_the_check_age_but_judges_short_jobs_at_the_end(self, engine):
+        job, monitor = self._job(engine, 500, age_s=60)
+        engine._check_mem_underuse(job, monitor, time.time(), final=False)
+        assert not self._warnings(engine, job.id)
+        engine._check_mem_underuse(job, monitor, time.time(), final=True)
+        assert self._warnings(engine, job.id)
+
+    def test_a_job_using_its_reservation_is_left_alone(self, engine):
+        job, monitor = self._job(engine, 1500, age_s=600)
+        engine._check_mem_underuse(job, monitor, time.time(), final=True)
+        assert not self._warnings(engine, job.id)
+
+    def test_meta_moves_or_disables_the_check(self, engine):
+        late, monitor = self._job(engine, 500, age_s=600, meta={"mem_check": "20m"})
+        engine._check_mem_underuse(late, monitor, time.time(), final=False)
+        assert not self._warnings(engine, late.id)
+        off, monitor = self._job(engine, 500, age_s=600, meta={"mem_check": "off"})
+        engine._check_mem_underuse(off, monitor, time.time(), final=True)
+        assert not self._warnings(engine, off.id)

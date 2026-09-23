@@ -180,3 +180,19 @@ class TestVanishingCgroup:
         report = monitor.finish(now=10.0)
         assert report.foreign_cores is None
         assert "unknown" in report.note
+
+
+def test_peak_memory_is_the_high_water_mark(tmp_path):
+    from ajs.contention import ContentionMonitor
+
+    (tmp_path / "cpu.stat").write_text("usage_usec 0\n")
+    monitor = ContentionMonitor(2.0)
+    monitor._cgroup = tmp_path
+    for current in (300, 900, 200):
+        (tmp_path / "memory.current").write_text(str(current * 1024 * 1024))
+        monitor.poll(0.0)
+    assert monitor.mem_now_mb == 200
+    assert monitor.mem_peak_mb == 900
+    (tmp_path / "memory.peak").write_text(str(1500 * 1024 * 1024))
+    monitor.poll(0.0)
+    assert monitor.mem_peak_mb == 1500

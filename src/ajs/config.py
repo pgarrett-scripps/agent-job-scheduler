@@ -116,6 +116,18 @@ class Config:
     load. This check uses the kernel's own number, so a start cannot push the machine
     into the OOM killer however the bookkeeping looks."""
 
+    mem_underuse_ratio: float = 0.25
+    """Warn a job's owner when its peak memory stays under this share of what it
+    reserved. A reservation it never uses keeps other jobs queued on an idle machine."""
+
+    mem_underuse_min_mb: int = 4096
+    """Only reservations at least this large are worth a warning."""
+
+    mem_underuse_after_s: int = 300
+    """How long a job runs before its peak is judged, so a job still loading its input
+    is not flagged. A job can move its own check with ``--meta mem_check=20m`` (or
+    ``off``); jobs that end sooner are judged when they finish."""
+
     disk_floor_mb: int = 5120
     """Hard floor on free disk. Jobs are refused admission below this. Protects the root
     filesystem from a job that writes large output.
