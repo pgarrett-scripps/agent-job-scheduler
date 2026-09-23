@@ -130,6 +130,8 @@ class Job:
     # A held job stays queued but is never admitted until released. Queue management,
     # not a lifecycle state: it can be flipped back and forth while the job waits.
     held: bool = False
+    hold_until: float | None = None
+    """A timed hold: the daemon releases the job by itself at this epoch time."""
     # Submitter-supplied description, so whoever manages the queue can tell a paper's last
     # missing figure from an exploratory sweep. All optional and never interpreted.
     title: str | None = None
@@ -181,6 +183,7 @@ class Job:
             "reserved_until": self.reserved_until,
             "cancel_reason": self.cancel_reason,
             "held": self.held,
+            "hold_until": self.hold_until,
             "title": self.title,
             "description": self.description,
             "meta": self.meta,

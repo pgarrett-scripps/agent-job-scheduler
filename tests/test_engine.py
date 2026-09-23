@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import time
 from pathlib import Path
 
 import pytest
@@ -195,6 +196,20 @@ class TestTimeout:
         assert result["state"] == "timeout"
         assert "max_runtime" in (result["cancel_reason"] or "")
 
+    async def test_killing_a_stubborn_job_does_not_stall_the_tick(self, engine):
+        # Ignores SIGTERM, so the kill has to sit out the whole grace period.
+        cmd = ["/bin/sh", "-c", "trap '' TERM; while :; do sleep 0.05; done"]
+        job = engine.submit(project="p", session_id="s", cmd=cmd, cwd="/tmp", max_runtime_s=1)
+        async with asyncio.timeout(5):
+            while engine.store.get_job(job.id).state is not JobState.RUNNING:
+                await engine.tick()
+                await asyncio.sleep(0.02)
+        await asyncio.sleep(1.1)
+        async with asyncio.timeout(1):
+            await engine.tick()
+        result = await drive(engine, job.id, timeout=30)
+        assert result["state"] == "timeout"
+
 
 class TestWait:
     async def test_wait_returns_when_the_job_finishes(self, engine):
@@ -316,6 +331,33 @@ class TestQueueManagement:
         engine.release(job.id, actor="me", reason="go")
         result = await drive(engine, job.id)
         assert result["state"] == "done"
+
+    async def test_timed_hold_releases_itself(self, engine):
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")
+        engine.hold(job.id, actor="me", reason="later", until=time.time() + 0.3)
+        await engine.tick()
+        assert engine.store.get_job(job.id).state is JobState.QUEUED
+        assert " until " in engine.blocked_reason(job.id)
+        await asyncio.sleep(0.35)
+        result = await drive(engine, job.id)
+        assert result["state"] == "done"
+        [release] = [e for e in engine.store.events(job_id=job.id) if e["action"] == "release"]
+        assert release["actor"] == "ajs"
+
+    async def test_submit_with_start_time(self, engine):
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", hold_until=time.time() + 60)
+        await engine.tick()
+        stored = engine.store.get_job(job.id)
+        assert stored.held and stored.hold_until is not None
+        engine.release(job.id, actor="me")
+        assert engine.store.get_job(job.id).hold_until is None
+        assert (await drive(engine, job.id))["state"] == "done"
+
+    async def test_timed_pause_resumes_itself(self, engine):
+        engine.paused, engine.pause_until = True, time.time() - 1
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")
+        assert (await drive(engine, job.id))["state"] == "done"
+        assert engine.paused is False and engine.pause_until is None
 
     async def test_hold_records_actor_and_reason(self, engine):
         engine.paused = True

@@ -127,8 +127,10 @@ class Server:
     async def do_cancel(self, job_id: int, reason: str = "cancelled by user") -> bool:
         return await self.engine.cancel(int(job_id), reason)
 
-    def do_hold(self, job_id: int, actor: str = "", reason: str = "") -> dict[str, Any]:
-        return self.engine.hold(int(job_id), actor=actor, reason=reason).to_dict()
+    def do_hold(self, job_id: int, actor: str = "", reason: str = "", until: float | None = None) -> dict[str, Any]:
+        return self.engine.hold(
+            int(job_id), actor=actor, reason=reason, until=None if until is None else float(until)
+        ).to_dict()
 
     def do_release(self, job_id: int, actor: str = "", reason: str = "") -> dict[str, Any]:
         return self.engine.release(int(job_id), actor=actor, reason=reason).to_dict()
@@ -142,12 +144,14 @@ class Server:
     def do_logs(self, job_id: int, lines: int = 50) -> str:
         return self.engine.log_tail(int(job_id), int(lines))
 
-    def do_pause(self) -> bool:
+    def do_pause(self, until: float | None = None) -> bool:
         self.engine.paused = True
+        self.engine.pause_until = None if until is None else float(until)
         return True
 
     def do_resume(self) -> bool:
         self.engine.paused = False
+        self.engine.pause_until = None
         self.engine.draining = False
         self.engine.wake()
         return True

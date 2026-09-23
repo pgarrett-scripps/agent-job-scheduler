@@ -119,3 +119,17 @@ def test_client_folds_new_fields_into_note_for_an_old_daemon(monkeypatch):
     sent = Client.__new__(Client).submit(cmd=["x"], title="fig 3", description="blocks paper", meta={"est": "40m"})
     assert sent == {"cmd": ["x"], "note": "fig 3 | blocks paper | est=40m"}
     assert len(calls) == 2
+
+
+def test_parse_when():
+    import datetime as dt
+
+    from ajs.cli import parse_when
+
+    now = dt.datetime(2026, 9, 22, 18, 0).timestamp()
+    assert parse_when("5h", now) == now + 5 * 3600
+    assert parse_when("22:30", now) == dt.datetime(2026, 9, 22, 22, 30).timestamp()
+    assert parse_when("08:00", now) == dt.datetime(2026, 9, 23, 8, 0).timestamp()  # tomorrow
+    assert parse_when("2026-09-24 09:15", now) == dt.datetime(2026, 9, 24, 9, 15).timestamp()
+    with pytest.raises(ValueError, match="cannot read"):
+        parse_when("soonish", now)

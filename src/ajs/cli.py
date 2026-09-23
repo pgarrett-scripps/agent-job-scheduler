@@ -123,6 +123,33 @@ def forwarded_env(source: Mapping[str, str] | None = None, extra: list[str] | No
     return env
 
 
+def parse_when(value: str, now: float | None = None) -> float:
+    """A future moment as epoch seconds: a delay ("5h", "90m"), a clock time ("22:30",
+    the next one to come), or an ISO date-time ("2026-09-23 08:00")."""
+    import datetime as dt
+
+    now = time.time() if now is None else now
+    value = value.strip()
+    try:
+        return now + parse_duration(value)
+    except ValueError:
+        pass
+    base = dt.datetime.fromtimestamp(now)
+    try:
+        clock = dt.time.fromisoformat(value)
+    except ValueError:
+        clock = None
+    if clock is not None:
+        when = base.replace(hour=clock.hour, minute=clock.minute, second=clock.second, microsecond=0)
+        if when.timestamp() <= now:
+            when += dt.timedelta(days=1)
+        return when.timestamp()
+    try:
+        return dt.datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        raise ValueError(f"cannot read {value!r} as a time: use 5h, 22:30 or 2026-09-23 08:00") from None
+
+
 def parse_meta(pairs: list[str] | None) -> dict[str, str]:
     """`--meta KEY=VALUE` flags into a dict. A later key overrides an earlier one."""
     out: dict[str, str] = {}
@@ -197,6 +224,9 @@ def submit(
         typer.Option("--meta", help="KEY=VALUE, repeatable, e.g. --meta paper=uno --meta est=40m."),
     ] = None,
     hold: Annotated[bool, typer.Option("--hold", help="Queue it held: it will not start until `ajs release`.")] = False,
+    after: Annotated[
+        str, typer.Option("--after", help="Do not start before this: 5h, 22:30 or 2026-09-23 08:00.")
+    ] = "",
     env: Annotated[
         list[str] | None,
         typer.Option("--env", "-e", help="Extra environment for the job: KEY=VALUE, or KEY to copy from your shell."),
@@ -217,6 +247,7 @@ def submit(
         mem_mb, gpu_mem_mb, disk_mb = parse_mem(mem), parse_mem(gpu_mem), parse_mem(disk)
         max_runtime_s = parse_duration(max_runtime)
         meta_map = parse_meta(meta)
+        hold_until = parse_when(after) if after else None
     except ValueError as exc:
         _fail(str(exc))
         return
@@ -244,6 +275,7 @@ def submit(
             **({"description": description} if description else {}),
             **({"meta": meta_map} if meta_map else {}),
             **({"held": True} if hold else {}),
+            **({"hold_until": hold_until} if hold_until is not None else {}),
         )
     except protocol.SchedulerError as exc:
         _fail(str(exc))
@@ -340,13 +372,22 @@ def cancel(
 def hold_cmd(
     job_ids: Annotated[list[int], typer.Argument(help="Queued job id(s).")],
     reason: Annotated[str, typer.Option("--reason", "-r", help="Why; recorded in `ajs events`.")] = "",
+    until: Annotated[
+        str, typer.Option("--until", "-u", help="Release by itself at: 5h, 22:30 or 2026-09-23 08:00.")
+    ] = "",
 ) -> None:
     """Keep queued job(s) from starting until released. They keep their place."""
+    try:
+        when = parse_when(until) if until else None
+    except ValueError as exc:
+        _fail(str(exc))
+        return
+    suffix = f" until {time.strftime('%a %H:%M', time.localtime(when))}" if when is not None else ""
     client = _client()
     for job_id in job_ids:
         try:
-            client.hold(job_id, actor=session_identity(), reason=reason)
-            console.print(f"[yellow]held[/yellow] job {job_id}")
+            client.hold(job_id, actor=session_identity(), reason=reason, until=when)
+            console.print(f"[yellow]held[/yellow] job {job_id}{suffix}")
         except protocol.SchedulerError as exc:
             _fail(str(exc))
 
@@ -494,7 +535,10 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
     cap, used = data["capacity"], data["used"]
     flags = []
     if data["paused"]:
-        flags.append("[yellow]PAUSED[/yellow]")
+        until = data.get("pause_until")
+        flags.append(
+            "[yellow]PAUSED[/yellow]" + (f" until {time.strftime('%a %H:%M', time.localtime(until))}" if until else "")
+        )
     if data["draining"]:
         flags.append("[yellow]DRAINING[/yellow]")
     header = "  ".join(flags)
@@ -665,10 +709,20 @@ def ps_cmd(
 
 
 @app.command()
-def pause() -> None:
+def pause(
+    until: Annotated[str, typer.Option("--for", "--until", "-u", help="Resume by itself after 5h, or at 22:30.")] = "",
+) -> None:
     """Stop starting new jobs. Running jobs continue."""
-    _client().call("pause")
-    console.print("[yellow]paused[/yellow] - no new jobs will start")
+    try:
+        when = parse_when(until) if until else None
+    except ValueError as exc:
+        _fail(str(exc))
+        return
+    _client().call("pause", **({"until": when} if when is not None else {}))
+    if when is None:
+        console.print("[yellow]paused[/yellow] - no new jobs will start")
+    else:
+        console.print(f"[yellow]paused[/yellow] until {time.strftime('%a %H:%M', time.localtime(when))}")
 
 
 @app.command()

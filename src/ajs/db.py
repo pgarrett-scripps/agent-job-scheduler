@@ -87,6 +87,7 @@ _ADDED_COLUMNS = (
     ("note", "TEXT"),  # the job's description; named before `title` existed
     ("title", "TEXT"),
     ("meta", "TEXT NOT NULL DEFAULT '{}'"),
+    ("hold_until", "REAL"),
 )
 
 
@@ -132,13 +133,14 @@ class Store:
         description: str | None = None,
         meta: dict[str, str] | None = None,
         held: bool = False,
+        hold_until: float | None = None,
     ) -> Job:
         now = time.time()
         cur = self.conn.execute(
             """INSERT INTO jobs
                (project, session_id, cmd, cwd, env, resources, max_runtime_s, job_class, state, submitted_at,
-                title, note, meta, held)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                title, note, meta, held, hold_until)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 project,
                 session_id,
@@ -154,6 +156,7 @@ class Store:
                 description,
                 json.dumps(meta or {}),
                 int(held),
+                hold_until,
             ),
         )
         job_id = int(cur.lastrowid or 0)
@@ -296,6 +299,7 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         reserved_until=row["reserved_until"],
         cancel_reason=row["cancel_reason"],
         held=bool(row["held"]),
+        hold_until=row["hold_until"],
         title=row["title"],
         description=row["note"],
         meta=json.loads(row["meta"] or "{}"),

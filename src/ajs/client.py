@@ -98,8 +98,10 @@ class Client:
     def cancel(self, job_id: int, reason: str = "cancelled by user") -> bool:
         return bool(self.call("cancel", job_id=job_id, reason=reason))
 
-    def hold(self, job_id: int, *, actor: str, reason: str) -> dict[str, Any]:
-        return self.call("hold", job_id=job_id, actor=actor, reason=reason)
+    def hold(self, job_id: int, *, actor: str, reason: str, until: float | None = None) -> dict[str, Any]:
+        # `until` only when set, so this still talks to a daemon that predates it.
+        extra = {"until": until} if until is not None else {}
+        return self.call("hold", job_id=job_id, actor=actor, reason=reason, **extra)
 
     def release(self, job_id: int, *, actor: str, reason: str = "") -> dict[str, Any]:
         return self.call("release", job_id=job_id, actor=actor, reason=reason)

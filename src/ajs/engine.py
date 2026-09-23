@@ -40,6 +40,8 @@ class Engine:
         self.last_finish_at: float = 0.0
         self.external = ExternalLoad(half_life_s=cfg.external_load_half_life_s)
         self.paused = False
+        self.pause_until: float | None = None
+        """Set by `ajs pause --for`: the tick resumes by itself at this epoch time."""
         self.draining = False
         self._waiters: dict[int, list[asyncio.Future[None]]] = {}
         self._wake = asyncio.Event()
@@ -101,8 +103,9 @@ class Engine:
         for lease_id in expired:
             log.warning("reclaimed lease %s: holder stopped heartbeating", lease_id)
 
-        await self._enforce_runtime_limits(now)
+        self._enforce_runtime_limits(now)
         self._enforce_disk_floor()
+        self._expire_timed_holds(now)
 
         if self.paused or self.draining:
             self.last_decision = Decision(
@@ -191,7 +194,17 @@ class Engine:
             usage["gpu_mem_mb"] += req.gpu_mem_mb
         return usage
 
-    async def _enforce_runtime_limits(self, now: float) -> None:
+    def _expire_timed_holds(self, now: float) -> None:
+        if self.paused and self.pause_until is not None and now >= self.pause_until:
+            log.info("timed pause over; resuming")
+            self.paused = False
+            self.pause_until = None
+        for job in self.store.jobs_in_state(JobState.QUEUED):
+            if job.held and job.hold_until is not None and now >= job.hold_until:
+                self.store.update_job(job.id, held=0, hold_until=None)
+                self.store.add_event(job.id, actor="ajs", action="release", reason="timed hold expired")
+
+    def _enforce_runtime_limits(self, now: float) -> None:
         """Kill jobs that blew past the max_runtime they declared.
 
         This is not just hygiene: backfill decisions were made assuming that ceiling, so
@@ -201,11 +214,16 @@ class Engine:
             if job.started_at is None:
                 continue
             if now - job.started_at > job.max_runtime_s:
+                if job.cancel_reason:
+                    continue  # already being stopped
                 rp = self.running.get(job.id)
                 log.warning("job %s exceeded max_runtime %ss; killing", job.id, job.max_runtime_s)
                 self.store.update_job(job.id, cancel_reason=f"exceeded max_runtime of {job.max_runtime_s}s")
                 if rp is not None:
-                    await self.executor.stop(rp)
+                    # In the background: the grace period must not stall the tick.
+                    task = asyncio.create_task(self.executor.stop(rp))
+                    self._tasks.add(task)
+                    task.add_done_callback(self._tasks.discard)
 
     def _enforce_disk_floor(self) -> None:
         free = sysinfo.free_disk_mb(self.cfg.disk_watch_path)
@@ -340,6 +358,7 @@ class Engine:
         meta: dict[str, str] | None = None,
         note: str | None = None,
         held: bool = False,
+        hold_until: float | None = None,
     ) -> Job:
         resources = ResourceRequest(
             cpu=cpu,
@@ -364,10 +383,12 @@ class Engine:
             # `note` was the first name for the description; still accepted from old clients.
             description=description or note or None,
             meta={str(k): str(v) for k, v in (meta or {}).items()},
-            held=held,
+            held=held or hold_until is not None,
+            hold_until=hold_until,
         )
-        if held:
-            self.store.add_event(job.id, actor=session_id, action="hold", reason="submitted held")
+        if held or hold_until is not None:
+            detail = f"until {_clock(hold_until)}" if hold_until is not None else ""
+            self.store.add_event(job.id, actor=session_id, action="hold", detail=detail, reason="submitted held")
         self.wake()
         return job
 
@@ -381,19 +402,20 @@ class Engine:
             raise ValueError(f"job {job_id} is {job.state}; only queued jobs can be managed")
         return job
 
-    def hold(self, job_id: int, *, actor: str, reason: str) -> Job:
-        """Keep a queued job out of scheduling until released."""
+    def hold(self, job_id: int, *, actor: str, reason: str, until: float | None = None) -> Job:
+        """Keep a queued job out of scheduling until released, or until ``until``."""
         job = self._queued_job(job_id)
-        if not job.held:
-            self.store.update_job(job_id, held=1, reserved_until=None)
-            self.store.add_event(job_id, actor=actor, action="hold", reason=reason)
+        if not job.held or until != job.hold_until:
+            self.store.update_job(job_id, held=1, hold_until=until, reserved_until=None)
+            detail = f"until {_clock(until)}" if until is not None else ""
+            self.store.add_event(job_id, actor=actor, action="hold", detail=detail, reason=reason)
             self.wake()
         return self._queued_job(job_id)
 
     def release(self, job_id: int, *, actor: str, reason: str = "") -> Job:
         job = self._queued_job(job_id)
         if job.held:
-            self.store.update_job(job_id, held=0)
+            self.store.update_job(job_id, held=0, hold_until=None)
             self.store.add_event(job_id, actor=actor, action="release", reason=reason)
             self.wake()
         return self._queued_job(job_id)
@@ -463,6 +485,8 @@ class Engine:
             if event is None:
                 return "held"
             why = f": {event['reason']}" if event.get("reason") else ""
+            if job.hold_until is not None:
+                why = f" until {_clock(job.hold_until)}{why}"
             return f"held by {short_actor(str(event.get('actor') or 'unknown'))}{why}"
         return None
 
@@ -500,6 +524,7 @@ class Engine:
                 else None
             ),
             "paused": self.paused,
+            "pause_until": self.pause_until,
             "draining": self.draining,
             "free_disk_mb": sysinfo.free_disk_mb(self.cfg.disk_watch_path),
             "disk_floor_mb": self.cfg.disk_floor_mb,
@@ -548,3 +573,11 @@ class Engine:
             data = fh.read()
         text = data.decode("utf-8", errors="replace")
         return "\n".join(text.splitlines()[-lines:])
+
+
+def _clock(ts: float | None) -> str:
+    """Local wall-clock time for a hold's expiry, with the date only if not today."""
+    if ts is None:
+        return "-"
+    fmt = "%H:%M" if time.localtime(ts)[:3] == time.localtime()[:3] else "%a %d %b %H:%M"
+    return time.strftime(fmt, time.localtime(ts))

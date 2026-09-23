@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from .advice import submission_warnings
-from .cli import detect_project, forwarded_env, parse_duration, parse_mem, session_identity
+from .cli import detect_project, forwarded_env, parse_duration, parse_mem, parse_when, session_identity
 from .client import Client
 from .protocol import SchedulerError
 
@@ -114,6 +114,7 @@ def build_server() -> Any:
         description: str = "",
         meta: dict[str, str] | None = None,
         note: str = "",
+        start_after: str = "",
     ) -> dict[str, Any]:
         """Queue a command and return immediately with a job id.
 
@@ -156,6 +157,8 @@ def build_server() -> Any:
                 Whoever manages the queue uses this to decide what goes first.
             meta: optional key/value extras, e.g. {"paper": "spectrl", "est": "40m"}.
             note: older name for `description`; still accepted.
+            start_after: do not start before this: "5h", "22:30" or "2026-09-23 08:00".
+                The job is queued held and released by the daemon at that time.
         """
         try:
             work_dir = cwd or os.getcwd()
@@ -178,6 +181,7 @@ def build_server() -> Any:
                 **({"title": title} if title else {}),
                 **({"description": description or note} if description or note else {}),
                 **({"meta": {str(k): str(v) for k, v in meta.items()}} if meta else {}),
+                **({"hold_until": parse_when(start_after)} if start_after else {}),
             )
             result: dict[str, Any] = {"ok": True, "job_id": job["id"], "state": job["state"]}
             warnings = submission_warnings(
@@ -293,15 +297,22 @@ def build_server() -> Any:
             return _err(exc)
 
     @mcp.tool
-    def hold_job(job_id: int, reason: str) -> dict[str, Any]:
+    def hold_job(job_id: int, reason: str, until: str = "") -> dict[str, Any]:
         """Keep a queued job from starting until `release_job`. It keeps its place in line.
+
+        `until` makes it a timed hold that releases by itself: "5h", "22:30" or
+        "2026-09-23 08:00".
 
         QUEUE MANAGEMENT: call this ONLY when the user has explicitly asked, in this
         conversation, for this change to the queue. Never to get your own job ahead and
         never on your own judgement: it reorders other agents' work. `reason` is required
         and is recorded with your session in `ajs events`.
         """
-        return _manage("hold", job_id, reason)
+        try:
+            extra = {"until": parse_when(until)} if until else {}
+        except ValueError as exc:
+            return _err(exc)
+        return _manage("hold", job_id, reason, **extra)
 
     @mcp.tool
     def release_job(job_id: int, reason: str) -> dict[str, Any]:
@@ -389,6 +400,7 @@ def _summarise(job: dict[str, Any]) -> dict[str, Any]:
         "timed_out",
         "class",
         "held",
+        "hold_until",
         "title",
         "description",
         "meta",
