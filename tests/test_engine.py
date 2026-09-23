@@ -591,3 +591,13 @@ class TestMemUnderuse:
         off, monitor = self._job(engine, 500, age_s=600, meta={"mem_check": "off"})
         engine._check_mem_underuse(off, monitor, time.time(), final=True)
         assert not self._warnings(engine, off.id)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(None, 300), ("20m", 1200), ("90", 90), ("off", None), ("inf", 300), ("1e400m", 300), ("-5m", 300), ("x", 300)],
+)
+def test_mem_check_after_never_raises(value, expected):
+    from ajs.engine import mem_check_after
+
+    assert mem_check_after(value, 300) == expected

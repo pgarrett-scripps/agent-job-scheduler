@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import secrets
 import time
 from pathlib import Path
@@ -377,8 +378,12 @@ class Engine:
     def _warn_mem_underuse(self, now: float) -> None:
         for job in self.store.jobs_in_state(JobState.RUNNING):
             monitor = self.monitors.get(job.id)
-            if monitor is not None:
+            if monitor is None:
+                continue
+            try:
                 self._check_mem_underuse(job, monitor, now, final=False)
+            except Exception:  # a warning must never stall the tick
+                log.exception("memory underuse check failed for job %s", job.id)
 
     def _check_mem_underuse(self, job: Job, monitor: ContentionMonitor, now: float, *, final: bool) -> None:
         """Tell the owner, once, when a job holds far more memory than it ever uses.
@@ -507,7 +512,10 @@ class Engine:
         }
 
         if monitor is not None and job is not None:
-            self._check_mem_underuse(job, monitor, now, final=True)
+            try:
+                self._check_mem_underuse(job, monitor, now, final=True)
+            except Exception:  # a warning must never stop a job being recorded
+                log.exception("memory underuse check failed for job %s", job_id)
         if monitor is not None:
             report = monitor.finish(now)
             fields["contended"] = 1 if report.contended else 0
@@ -898,9 +906,11 @@ def mem_check_after(value: str | None, default_s: int) -> int | None:
     if value in ("off", "no", "false", "0"):
         return None
     units = {"s": 1, "m": 60, "h": 3600}
+    scale = units.get(value[-1:], 1)
     try:
-        if value and value[-1] in units:
-            return int(float(value[:-1]) * units[value[-1]])
-        return int(float(value))
+        seconds = float(value[:-1] if value[-1:] in units else value) * scale
     except ValueError:
         return default_s
+    if not math.isfinite(seconds) or seconds < 0:
+        return default_s
+    return int(seconds)
