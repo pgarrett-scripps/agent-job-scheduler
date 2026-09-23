@@ -105,12 +105,19 @@ def cgroup_mem_bytes(path: Path) -> int | None:
         return None
 
 
-def cgroup_mem_peak_bytes(path: Path) -> int | None:
-    """Most memory ever charged to ``path`` (cgroup v2 ``memory.peak``, Linux 5.19+)."""
+def cgroup_anon_bytes(path: Path) -> int | None:
+    """Memory the processes in ``path`` really hold (anonymous plus shared memory),
+    leaving out page cache the kernel can drop."""
     try:
-        return int((path / "memory.peak").read_text().strip())
-    except (OSError, ValueError):
+        stat = (path / "memory.stat").read_text()
+    except OSError:
         return None
+    total = None
+    for line in stat.splitlines():
+        key, _, value = line.partition(" ")
+        if key in ("anon", "shmem"):
+            total = (total or 0) + int(value)
+    return total
 
 
 @dataclass(slots=True)
@@ -151,7 +158,8 @@ class ContentionMonitor:
         """Cores the job used over the most recent tick, for `ajs top`."""
         self.mem_now_mb: int | None = None
         self.mem_peak_mb: int | None = None
-        """Most memory the job has held, for telling owners they reserved too much."""
+        """Most anonymous memory the job has held, for telling owners they reserved too
+        much. Page cache is left out: it grows to fill any limit and is reclaimable."""
 
     def start(self, pid: int | None, now: float, *, cgroup: Path | None = None) -> None:
         """Take the opening samples.
@@ -197,12 +205,15 @@ class ContentionMonitor:
             self._last_cpu, self._last_cpu_at = cpu, now
         mem = self.current_mem_bytes()
         self.mem_now_mb = mem // (1024 * 1024) if mem is not None else None
-        # The kernel's own high-water mark catches spikes between ticks; older kernels
-        # lack it, and then the largest sampled value has to do.
-        peak = cgroup_mem_peak_bytes(self._cgroup) if self._cgroup is not None else None
-        for value in (peak // (1024 * 1024) if peak is not None else None, self.mem_now_mb):
-            if value is not None and (self.mem_peak_mb is None or value > self.mem_peak_mb):
-                self.mem_peak_mb = value
+        # Only the job's own memory counts, not page cache: a job reading large files
+        # fills its cgroup with reclaimable cache right up to its limit, which would
+        # make every reservation look fully used. The kernel keeps no high-water mark
+        # for anonymous memory alone, so the largest sampled value has to do.
+        anon = cgroup_anon_bytes(self._cgroup) if self._cgroup is not None else None
+        if anon is not None:
+            anon_mb = anon // (1024 * 1024)
+            if self.mem_peak_mb is None or anon_mb > self.mem_peak_mb:
+                self.mem_peak_mb = anon_mb
         return cpu, mem
 
     def finish(self, now: float) -> ContentionReport:

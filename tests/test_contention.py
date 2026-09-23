@@ -182,17 +182,16 @@ class TestVanishingCgroup:
         assert "unknown" in report.note
 
 
-def test_peak_memory_is_the_high_water_mark(tmp_path):
+def test_peak_memory_counts_the_jobs_own_memory_not_page_cache(tmp_path):
     from ajs.contention import ContentionMonitor
 
+    mb = 1024 * 1024
     (tmp_path / "cpu.stat").write_text("usage_usec 0\n")
+    (tmp_path / "memory.current").write_text(str(14000 * mb))
     monitor = ContentionMonitor(2.0)
     monitor._cgroup = tmp_path
-    for current in (300, 900, 200):
-        (tmp_path / "memory.current").write_text(str(current * 1024 * 1024))
+    for anon in (300, 900, 200):
+        (tmp_path / "memory.stat").write_text(f"anon {anon * mb}\nfile {13000 * mb}\nshmem {100 * mb}\n")
         monitor.poll(0.0)
-    assert monitor.mem_now_mb == 200
-    assert monitor.mem_peak_mb == 900
-    (tmp_path / "memory.peak").write_text(str(1500 * 1024 * 1024))
-    monitor.poll(0.0)
-    assert monitor.mem_peak_mb == 1500
+    assert monitor.mem_now_mb == 14000
+    assert monitor.mem_peak_mb == 1000
