@@ -17,6 +17,8 @@ from rich.console import Group, RenderableType
 from rich.table import Table
 from rich.text import Text
 
+from .models import display_name
+
 BAR_WIDTH = 30
 
 
@@ -102,7 +104,7 @@ def _running_table(jobs: list[dict[str, Any]], now: float) -> RenderableType:
     table.add_column("cpu now/decl", justify="right", no_wrap=True)
     table.add_column("mem now/decl", justify="right", no_wrap=True)
     table.add_column("elapsed/max", justify="right", no_wrap=True)
-    table.add_column("command", overflow="ellipsis", ratio=1)
+    table.add_column("job", overflow="ellipsis", ratio=1)
     for job in jobs:
         tags = ""
         if job.get("exclusive"):
@@ -126,7 +128,7 @@ def _running_table(jobs: list[dict[str, Any]], now: float) -> RenderableType:
             cpu_cell,
             mem_cell,
             f"{fmt_secs(elapsed)}/{fmt_secs(job['max_runtime_s'])}",
-            job["cmd_str"],
+            display_name(job),
         )
     return table
 
@@ -141,7 +143,7 @@ def _queued_table(jobs: list[dict[str, Any]], now: float) -> RenderableType:
     table.add_column("needs", no_wrap=True)
     table.add_column("waited", justify="right", no_wrap=True)
     table.add_column("waiting on", overflow="fold", ratio=2)
-    table.add_column("command", overflow="ellipsis", ratio=1)
+    table.add_column("job", overflow="ellipsis", ratio=1)
     for job in jobs:
         needs = f"{job['cpu']}cpu {fmt_mem(job['mem_mb'])}"
         if job.get("gpu_mem_mb"):
@@ -161,7 +163,7 @@ def _queued_table(jobs: list[dict[str, Any]], now: float) -> RenderableType:
             needs,
             fmt_secs(now - job["submitted_at"]),
             job.get("blocked_reason") or "-",
-            job["cmd_str"],
+            display_name(job),
         )
     return table
 

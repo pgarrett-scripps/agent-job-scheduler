@@ -130,9 +130,12 @@ class Job:
     # A held job stays queued but is never admitted until released. Queue management,
     # not a lifecycle state: it can be flipped back and forth while the job waits.
     held: bool = False
-    note: str | None = None
-    """Free text from the submitter on what the job is for, so whoever manages the queue
-    can tell a paper's last missing figure from an exploratory sweep."""
+    # Submitter-supplied description, so whoever manages the queue can tell a paper's last
+    # missing figure from an exploratory sweep. All optional and never interpreted.
+    title: str | None = None
+    description: str | None = None
+    meta: dict[str, str] = field(default_factory=dict)
+    """Free-form key=value pairs, e.g. {"paper": "uno", "est": "40m"}."""
 
     @property
     def cmd_str(self) -> str:
@@ -178,8 +181,16 @@ class Job:
             "reserved_until": self.reserved_until,
             "cancel_reason": self.cancel_reason,
             "held": self.held,
-            "note": self.note,
+            "title": self.title,
+            "description": self.description,
+            "meta": self.meta,
+            "note": self.description,  # pre-title name, kept for older clients
         }
+
+
+def display_name(job: dict[str, Any]) -> str:
+    """What to show for a job in a table: its title if the submitter gave one."""
+    return job.get("title") or job.get("cmd_str") or ""
 
 
 def short_actor(actor: str) -> str:

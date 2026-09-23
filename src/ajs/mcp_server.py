@@ -64,8 +64,9 @@ output, rather than one multi-hour job. Other agents' jobs can then start betwee
 chunks instead of waiting hours. Never use exclusive=true for throughput: it drains the
 whole machine first. Submissions that look like either pattern come back with `warnings`.
 
-Pass `note` with every submission: one line on what the job is for and what it
-unblocks. The queue is ordered by people and agents reading those notes.
+Pass `title` and `description` with every submission: a short name, and one line on
+what the job is for and what it unblocks. Add `meta` for anything else worth knowing,
+especially `est` (expected runtime). The queue is ordered by people reading these.
 
 Do not reorder the queue (hold_job, release_job, set_job_priority) unless the user has
 explicitly asked you to in this conversation. Cancelling your own job stays fine.
@@ -109,6 +110,9 @@ def build_server() -> Any:
         job_class: str = "batch",
         project: str | None = None,
         env: dict[str, str] | None = None,
+        title: str = "",
+        description: str = "",
+        meta: dict[str, str] | None = None,
         note: str = "",
     ) -> dict[str, Any]:
         """Queue a command and return immediately with a job id.
@@ -145,9 +149,13 @@ def build_server() -> Any:
             project: defaults to the git repo name at cwd.
             env: extra environment variables for the job. PATH and the usual toolchain
                 variables are forwarded from this session automatically.
-            note: one line on what the job is for and what it unblocks, e.g. "Table 2
-                timings for the spectrl paper". Whoever manages the queue uses this to
-                decide what goes first, so say it plainly.
+            title: short name shown in the queue, under 60 characters, e.g.
+                "spectrl Table 2 timings". Shown instead of the command.
+            description: one or two lines on what the job is for and what it unblocks,
+                e.g. "last missing number in the spectrl paper; blocks submission".
+                Whoever manages the queue uses this to decide what goes first.
+            meta: optional key/value extras, e.g. {"paper": "spectrl", "est": "40m"}.
+            note: older name for `description`; still accepted.
         """
         try:
             work_dir = cwd or os.getcwd()
@@ -167,11 +175,16 @@ def build_server() -> Any:
                 locks=list(locks or []),
                 max_runtime_s=parse_duration(max_runtime),
                 job_class=job_class,
-                **({"note": note} if note else {}),
+                **({"title": title} if title else {}),
+                **({"description": description or note} if description or note else {}),
+                **({"meta": {str(k): str(v) for k, v in meta.items()}} if meta else {}),
             )
             result: dict[str, Any] = {"ok": True, "job_id": job["id"], "state": job["state"]}
             warnings = submission_warnings(
-                exclusive=exclusive, gpu_exclusive=gpu_exclusive, max_runtime_s=parse_duration(max_runtime)
+                exclusive=exclusive,
+                gpu_exclusive=gpu_exclusive,
+                max_runtime_s=parse_duration(max_runtime),
+                title=title,
             )
             if warnings:
                 result["warnings"] = warnings
@@ -376,7 +389,9 @@ def _summarise(job: dict[str, Any]) -> dict[str, Any]:
         "timed_out",
         "class",
         "held",
-        "note",
+        "title",
+        "description",
+        "meta",
         "session_id",
     )
     return {k: job[k] for k in keys if k in job and job[k] is not None}

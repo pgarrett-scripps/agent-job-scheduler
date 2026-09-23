@@ -89,3 +89,33 @@ def test_session_identity_prefers_explicit_then_claude_then_user():
     assert session_identity({"AJS_SESSION": "x", "CLAUDE_CODE_SESSION_ID": "c"}) == "x"
     assert session_identity({"CLAUDE_CODE_SESSION_ID": "c", "USER": "u"}) == "claude:c"
     assert session_identity({"USER": "u"}) == "user:u"
+
+
+def test_parse_meta():
+    from ajs.cli import parse_meta
+
+    assert parse_meta(None) == {}
+    assert parse_meta(["paper=uno", "est = 40m", "paper=spectrl"]) == {"paper": "spectrl", "est": "40m"}
+    assert parse_meta(["expr=a=b"]) == {"expr": "a=b"}
+    with pytest.raises(ValueError, match="KEY=VALUE"):
+        parse_meta(["oops"])
+
+
+def test_client_folds_new_fields_into_note_for_an_old_daemon(monkeypatch):
+    from ajs import protocol
+    from ajs.client import Client
+
+    calls = []
+
+    def old_daemon(self, method, **params):
+        calls.append(params)
+        if "title" in params:
+            raise protocol.SchedulerError(
+                "bad parameters for submit: submit() got an unexpected keyword argument 'title'"
+            )
+        return params
+
+    monkeypatch.setattr(Client, "call", old_daemon)
+    sent = Client.__new__(Client).submit(cmd=["x"], title="fig 3", description="blocks paper", meta={"est": "40m"})
+    assert sent == {"cmd": ["x"], "note": "fig 3 | blocks paper | est=40m"}
+    assert len(calls) == 2

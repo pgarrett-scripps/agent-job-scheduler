@@ -318,6 +318,21 @@ class TestQueueManagement:
         job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", note="fig 3")
         assert engine.store.get_job(job.id).to_dict()["note"] == "fig 3"
 
+    async def test_title_description_meta_are_stored(self, engine):
+        job = engine.submit(
+            project="p",
+            session_id="s",
+            cmd=["/bin/true"],
+            cwd="/tmp",
+            title="uno fig 3",
+            description="last figure; blocks submission",
+            meta={"est": "40m", "n": 3},
+        )
+        stored = engine.store.get_job(job.id).to_dict()
+        assert stored["title"] == "uno fig 3"
+        assert stored["description"] == stored["note"] == "last figure; blocks submission"
+        assert stored["meta"] == {"est": "40m", "n": "3"}
+
 
 def test_old_database_gains_new_columns(tmp_path):
     import sqlite3
@@ -339,5 +354,5 @@ def test_old_database_gains_new_columns(tmp_path):
     conn.close()
     store = Store(path)
     [job] = store.jobs_in_state(JobState.QUEUED)
-    assert job.held is False and job.note is None
+    assert job.held is False and job.title is None and job.description is None and job.meta == {}
     store.close()

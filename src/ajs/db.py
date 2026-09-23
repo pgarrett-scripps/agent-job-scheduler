@@ -84,7 +84,9 @@ CREATE TABLE IF NOT EXISTS project_stats (
 
 _ADDED_COLUMNS = (
     ("held", "INTEGER NOT NULL DEFAULT 0"),
-    ("note", "TEXT"),
+    ("note", "TEXT"),  # the job's description; named before `title` existed
+    ("title", "TEXT"),
+    ("meta", "TEXT NOT NULL DEFAULT '{}'"),
 )
 
 
@@ -126,15 +128,17 @@ class Store:
         resources: ResourceRequest,
         max_runtime_s: int,
         job_class: JobClass,
-        note: str | None = None,
+        title: str | None = None,
+        description: str | None = None,
+        meta: dict[str, str] | None = None,
         held: bool = False,
     ) -> Job:
         now = time.time()
         cur = self.conn.execute(
             """INSERT INTO jobs
                (project, session_id, cmd, cwd, env, resources, max_runtime_s, job_class, state, submitted_at,
-                note, held)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                title, note, meta, held)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 project,
                 session_id,
@@ -146,7 +150,9 @@ class Store:
                 str(job_class),
                 str(JobState.QUEUED),
                 now,
-                note,
+                title,
+                description,
+                json.dumps(meta or {}),
                 int(held),
             ),
         )
@@ -290,5 +296,7 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         reserved_until=row["reserved_until"],
         cancel_reason=row["cancel_reason"],
         held=bool(row["held"]),
-        note=row["note"],
+        title=row["title"],
+        description=row["note"],
+        meta=json.loads(row["meta"] or "{}"),
     )

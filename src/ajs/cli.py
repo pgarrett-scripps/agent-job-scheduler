@@ -24,7 +24,7 @@ from . import protocol
 from .advice import submission_warnings
 from .client import Client
 from .config import Config, config_path, socket_path, state_dir
-from .models import short_actor
+from .models import display_name, short_actor
 
 app = typer.Typer(
     add_completion=False,
@@ -123,6 +123,17 @@ def forwarded_env(source: Mapping[str, str] | None = None, extra: list[str] | No
     return env
 
 
+def parse_meta(pairs: list[str] | None) -> dict[str, str]:
+    """`--meta KEY=VALUE` flags into a dict. A later key overrides an earlier one."""
+    out: dict[str, str] = {}
+    for pair in pairs or []:
+        key, sep, value = pair.partition("=")
+        if not sep or not key.strip():
+            raise ValueError(f"--meta wants KEY=VALUE, got {pair!r}")
+        out[key.strip()] = value.strip()
+    return out
+
+
 def session_identity(source: Mapping[str, str] | None = None) -> str:
     """Who is calling: an explicit AJS_SESSION, else the Claude Code session, else the user.
 
@@ -172,9 +183,19 @@ def submit(
     job_class: Annotated[str, typer.Option("--class", help="interactive | batch | background")] = "batch",
     project: Annotated[str | None, typer.Option("--project", "-p", help="Defaults to the git repo name.")] = None,
     session: Annotated[str, typer.Option("--session", help="Opaque submitter id.")] = "",
-    note: Annotated[
-        str, typer.Option("--note", "-n", help="What this job is for, e.g. 'last figure for the uno paper'.")
+    title: Annotated[
+        str, typer.Option("--title", "-T", help="Short name shown in status, e.g. 'uno fig 3 timing'.")
     ] = "",
+    description: Annotated[
+        str,
+        typer.Option(
+            "--description", "-d", "--note", "-n", help="What it is for and what it unblocks, one or two lines."
+        ),
+    ] = "",
+    meta: Annotated[
+        list[str] | None,
+        typer.Option("--meta", help="KEY=VALUE, repeatable, e.g. --meta paper=uno --meta est=40m."),
+    ] = None,
     hold: Annotated[bool, typer.Option("--hold", help="Queue it held: it will not start until `ajs release`.")] = False,
     env: Annotated[
         list[str] | None,
@@ -195,6 +216,7 @@ def submit(
         job_env = forwarded_env(extra=env)
         mem_mb, gpu_mem_mb, disk_mb = parse_mem(mem), parse_mem(gpu_mem), parse_mem(disk)
         max_runtime_s = parse_duration(max_runtime)
+        meta_map = parse_meta(meta)
     except ValueError as exc:
         _fail(str(exc))
         return
@@ -218,21 +240,25 @@ def submit(
             max_runtime_s=max_runtime_s,
             job_class=job_class,
             # Only sent when used, so this client still talks to a daemon that predates them.
-            **({"note": note} if note else {}),
+            **({"title": title} if title else {}),
+            **({"description": description} if description else {}),
+            **({"meta": meta_map} if meta_map else {}),
             **({"held": True} if hold else {}),
         )
     except protocol.SchedulerError as exc:
         _fail(str(exc))
         return
 
-    for warning in submission_warnings(exclusive=exclusive, gpu_exclusive=gpu_exclusive, max_runtime_s=max_runtime_s):
+    for warning in submission_warnings(
+        exclusive=exclusive, gpu_exclusive=gpu_exclusive, max_runtime_s=max_runtime_s, title=title
+    ):
         err_console.print(f"[yellow]note:[/yellow] {warning}")
 
     if not wait:
         if json_out:
             console.print_json(data=job)
         else:
-            console.print(f"[green]queued[/green] job [bold]{job['id']}[/bold]: {job['cmd_str']}")
+            console.print(f"[green]queued[/green] job [bold]{job['id']}[/bold]: {display_name(job)}")
             console.print(f"  follow with: [dim]ajs wait {job['id']}[/dim]")
         return
 
@@ -389,6 +415,40 @@ def events_cmd(
     console.print(table)
 
 
+@app.command(name="job")
+def job_cmd(
+    job_id: Annotated[int, typer.Argument(help="Job id.")],
+    json_out: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """Everything about one job: what it is for, what it asked for, where it stands."""
+    try:
+        job = _client().job(job_id)
+    except protocol.SchedulerError as exc:
+        _fail(str(exc))
+        return
+    if json_out:
+        console.print_json(data=job)
+        return
+    state = job["state"] + (" (held)" if job.get("held") and job["state"] == "queued" else "")
+    console.print(f"[bold]job {job['id']}[/bold]  {job['project']}  {state}  class={job.get('class', '-')}")
+    if job.get("title"):
+        console.print(f"  title:   {job['title']}")
+    if job.get("description") or job.get("note"):
+        console.print(f"  for:     {job.get('description') or job.get('note')}")
+    for key, value in (job.get("meta") or {}).items():
+        console.print(f"  {key}: {value}")
+    console.print(f"  command: {job['cmd_str']}")
+    needs = f"{job['cpu']} cpu, {job['mem_mb']}M"
+    if job.get("gpu"):
+        needs += f", gpu {job.get('gpu_mem_mb', 0)}M"
+    if job.get("exclusive"):
+        needs += ", exclusive"
+    console.print(f"  needs:   {needs}, max {job['max_runtime_s'] // 60}m")
+    console.print(f"  by:      {short_actor(job.get('session_id') or '-')}  cwd {job.get('cwd', '-')}")
+    if job.get("blocked_reason"):
+        console.print(f"  waiting: {job['blocked_reason']}")
+
+
 @app.command()
 def logs(
     job_id: Annotated[int, typer.Argument()],
@@ -469,7 +529,7 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
         table.add_column("cpu", justify="right")
         table.add_column("mem", justify="right")
         table.add_column("elapsed", justify="right")
-        table.add_column("command", overflow="fold")
+        table.add_column("job", overflow="fold")
         for job in data["running"]:
             tag = " [magenta]X[/magenta]" if job["exclusive"] else ""
             table.add_row(
@@ -478,7 +538,7 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
                 str(job["cpu"]),
                 f"{job['mem_mb']}M",
                 f"{job['runtime_s'] or 0:.0f}s",
-                job["cmd_str"],
+                display_name(job),
             )
         console.print(table)
 
@@ -487,6 +547,7 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
         table.add_column("id", justify="right")
         table.add_column("project")
         table.add_column("class")
+        table.add_column("job", overflow="fold")
         table.add_column("needs")
         table.add_column("waiting on", overflow="fold")
         for job in data["queued"]:
@@ -498,12 +559,14 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
             if job.get("gpu_exclusive"):
                 needs += "/gpu-exclusive"
             waiting = job.get("blocked_reason") or "-"
-            if job.get("note"):
-                waiting += f"\n[dim]for: {job['note']}[/dim]"
+            what = display_name(job)
+            if job.get("description") or job.get("note"):
+                what += f"\n[dim]{job.get('description') or job.get('note')}[/dim]"
             table.add_row(
                 str(job["id"]),
                 job["project"],
                 "[yellow]HELD[/yellow]" if job.get("held") else job.get("class", "-"),
+                what,
                 needs,
                 waiting,
             )
@@ -584,7 +647,7 @@ def ps_cmd(
     table.add_column("state")
     table.add_column("project")
     table.add_column("time", justify="right")
-    table.add_column("command", overflow="fold")
+    table.add_column("job", overflow="fold")
     colours = {"done": "green", "failed": "red", "running": "cyan", "queued": "yellow"}
     for job in jobs:
         state = job["state"]
@@ -596,7 +659,7 @@ def ps_cmd(
             f"[{colours.get(state, 'white')}]{state}[/{colours.get(state, 'white')}]{mark}",
             job["project"],
             f"{job['runtime_s'] or 0:.0f}s",
-            job["cmd_str"],
+            display_name(job),
         )
     console.print(table)
 

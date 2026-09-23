@@ -331,6 +331,9 @@ class Engine:
         locks: list[str] | None = None,
         max_runtime_s: int | None = None,
         job_class: str = "batch",
+        title: str | None = None,
+        description: str | None = None,
+        meta: dict[str, str] | None = None,
         note: str | None = None,
         held: bool = False,
     ) -> Job:
@@ -353,7 +356,10 @@ class Engine:
             resources=resources,
             max_runtime_s=max_runtime_s or self.cfg.default_max_runtime_s,
             job_class=JobClass(job_class),
-            note=note or None,
+            title=title or None,
+            # `note` was the first name for the description; still accepted from old clients.
+            description=description or note or None,
+            meta={str(k): str(v) for k, v in (meta or {}).items()},
             held=held,
         )
         if held:

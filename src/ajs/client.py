@@ -69,7 +69,20 @@ class Client:
     # --- convenience wrappers --------------------------------------------
 
     def submit(self, **params: Any) -> dict[str, Any]:
-        return self.call("submit", **params)
+        try:
+            return self.call("submit", **params)
+        except protocol.SchedulerError as exc:
+            described = {k: params[k] for k in ("title", "description", "meta") if k in params}
+            if not described or "unexpected keyword argument" not in str(exc):
+                raise
+        # The daemon predates title/description/meta: fold them into its `note` field so a
+        # client upgrade never has to wait for a daemon restart.
+        folded = {k: v for k, v in params.items() if k not in described}
+        meta = " ".join(f"{k}={v}" for k, v in (described.get("meta") or {}).items())
+        folded["note"] = " | ".join(
+            str(p) for p in (described.get("title"), described.get("description") or params.get("note"), meta) if p
+        )
+        return self.call("submit", **folded)
 
     def status(self) -> dict[str, Any]:
         return self.call("status")
