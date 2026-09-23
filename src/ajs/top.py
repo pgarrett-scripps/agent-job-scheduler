@@ -79,6 +79,57 @@ def _capacity_rows(data: dict[str, Any]) -> Table:
     return table
 
 
+def _measured_rows(data: dict[str, Any]) -> RenderableType | None:
+    """Real usage, ajs jobs against everything else, plus who the outside load is.
+
+    The capacity bars above show *reservations*; these show what the kernel says is
+    actually busy, which is what a timing run or an OOM cares about.
+    """
+    m = data.get("measured")
+    if not m or m.get("cpu_outside") is None:
+        return None
+    cap = data["capacity"]
+    table = Table.grid(padding=(0, 2))
+    table.add_column(style="bold")
+    table.add_column()
+    table.add_column()
+    out_cpu, allow = m["cpu_outside"], m["cpu_allowance"]
+    table.add_row(
+        "cpu real",
+        bar([(m["cpu_ajs"], "green"), (out_cpu, "yellow" if out_cpu > allow + 1 else "dim yellow")], cap["cpu"]),
+        f"{m['cpu_ajs']:.1f} ajs + {out_cpu:.1f} outside (allowance {allow:g})   iowait {m['iowait_pct']:.0f}%",
+    )
+    if m.get("mem_used_mb") is not None:
+        out_mem = m["mem_outside_mb"]
+        style = "yellow" if out_mem > m["mem_reserve_mb"] else "dim yellow"
+        table.add_row(
+            "mem real",
+            bar([(m["mem_ajs_mb"], "green"), (out_mem, style)], m["mem_total_mb"]),
+            f"{fmt_mem(m['mem_ajs_mb'])} ajs + {fmt_mem(out_mem)} outside of {fmt_mem(m['mem_total_mb'])}",
+        )
+    if m.get("quiet"):
+        table.add_row("timing", Text("quiet", style="green"), "")
+    else:
+        table.add_row("timing", Text("not quiet", style="yellow"), m.get("noise") or "")
+
+    procs: dict[int, dict[str, Any]] = {}
+    for row in (m.get("top_cpu") or []) + (m.get("top_mem") or []):
+        procs[row["pid"]] = row
+    if not procs:
+        return table
+    outside = Table(title="outside ajs", title_justify="left", header_style="bold", expand=True)
+    outside.add_column("pid", justify="right", no_wrap=True)
+    outside.add_column("process", no_wrap=True)
+    outside.add_column("cpu", justify="right", no_wrap=True)
+    outside.add_column("mem", justify="right", no_wrap=True)
+    outside.add_column("where", overflow="ellipsis", ratio=1)
+    for row in sorted(procs.values(), key=lambda r: (r["cores"], r["rss_mb"]), reverse=True):
+        outside.add_row(
+            str(row["pid"]), row["name"], f"{row['cores']:.1f}", fmt_mem(row["rss_mb"]), row.get("cwd") or "-"
+        )
+    return Group(table, outside)
+
+
 def _header(data: dict[str, Any]) -> Text:
     text = Text()
     load = data.get("load") or (0.0, 0.0, 0.0)
@@ -113,6 +164,9 @@ def _running_table(jobs: list[dict[str, Any]], now: float) -> RenderableType:
             tags += " [magenta]GX[/magenta]"
         elif job.get("gpu_mem_mb"):
             tags += f" [cyan]{fmt_mem(job['gpu_mem_mb'])} vram[/cyan]"
+        if job.get("interference"):
+            # A timing run something outside ajs has disturbed; `ajs job N` says what.
+            tags += f" [yellow]!{len(job['interference'])}[/yellow]"
         cpu_now = job.get("cpu_now")
         cpu_cell = f"{cpu_now:.1f}/{job['cpu']}" if cpu_now is not None else f"-/{job['cpu']}"
         if cpu_now is not None and cpu_now > job["cpu"] + 0.5:
@@ -183,6 +237,7 @@ def render(data: dict[str, Any], now: float | None = None) -> RenderableType:
     parts: list[RenderableType] = [
         _header(data),
         _capacity_rows(data),
+        *([measured] if (measured := _measured_rows(data)) is not None else []),
         Text(""),
         _running_table(data.get("running") or [], now),
         Text(""),

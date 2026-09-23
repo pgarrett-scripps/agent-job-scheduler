@@ -112,3 +112,29 @@ def test_formatters():
     assert fmt_mem(8192) == "8.0G"
     assert bar([(10, "green")], 20, width=10).plain == "█████░░░░░"
     assert bar([(30, "green")], 20, width=10).plain == "██████████"  # never overflows
+
+
+def test_measured_breakdown_names_outside_processes():
+    payload = _payload()
+    payload["measured"] = {
+        "cpu_ajs": 4.0,
+        "cpu_outside": 5.5,
+        "cpu_allowance": 2.0,
+        "iowait_pct": 11.0,
+        "mem_total_mb": 64000,
+        "mem_used_mb": 30000,
+        "mem_ajs_mb": 12000,
+        "mem_outside_mb": 18000,
+        "mem_reserve_mb": 6144,
+        "quiet": False,
+        "noise": "iowait 11%",
+        "top_cpu": [{"pid": 42, "name": "cc1", "cwd": "~/Repos/tacular-omics", "cores": 3.0, "rss_mb": 200}],
+        "top_mem": [{"pid": 42, "name": "cc1", "cwd": "~/Repos/tacular-omics", "cores": 3.0, "rss_mb": 200}],
+    }
+    payload["running"][0]["interference"] = ["12:21:00 cc1"]
+    out = _text(payload)
+    assert "4.0 ajs + 5.5 outside" in out
+    assert "not quiet" in out and "iowait 11%" in out
+    assert "cc1" in out and "~/Repos/tacular-omics" in out
+    assert out.count("42") >= 1
+    assert "!1" in out
