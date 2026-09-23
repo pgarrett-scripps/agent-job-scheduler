@@ -203,7 +203,7 @@ def build_server() -> Any:
                 gpu_exclusive=gpu_exclusive,
                 max_runtime_s=parse_duration(max_runtime),
                 title=title,
-            )
+            ) + list(job.get("warnings") or [])
             if warnings:
                 result["warnings"] = warnings
             return result

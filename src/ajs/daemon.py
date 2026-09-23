@@ -92,8 +92,12 @@ class Server:
         return True
 
     def do_submit(self, **params: Any) -> dict[str, Any]:
+        warnings = self.engine.dependency_warnings(params.get("after_ok"), params.get("after_any"))
         job = self.engine.submit(**params)
-        return job.to_dict()
+        data = job.to_dict()
+        if warnings:
+            data["warnings"] = warnings
+        return data
 
     def do_status(self) -> dict[str, Any]:
         return self.engine.status()

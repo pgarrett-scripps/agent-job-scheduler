@@ -443,6 +443,22 @@ class Engine:
 
     # --- API surface used by the server ------------------------------------
 
+    def dependency_warnings(self, after_ok: list[int] | None, after_any: list[int] | None) -> list[str]:
+        """Dependencies that will not make the new job wait the way its owner expects.
+
+        A finished dependency releases the job at once, so a chain built on it runs out
+        of order; a held one keeps it queued until someone releases the hold."""
+        warnings = []
+        for dep_id in [int(i) for i in (after_ok or []) + (after_any or [])]:
+            dep = self.store.get_job(dep_id)
+            if dep is None:
+                continue  # submit() refuses these
+            if dep.state.is_terminal:
+                warnings.append(f"dependency {dep_id} already ended {dep.state}, so this job does not wait for it")
+            elif dep.held:
+                warnings.append(f"dependency {dep_id} is held, so this job waits until someone releases it")
+        return warnings
+
     def submit(
         self,
         *,

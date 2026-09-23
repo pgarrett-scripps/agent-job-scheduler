@@ -293,7 +293,7 @@ def submit(
 
     for warning in submission_warnings(
         exclusive=exclusive, gpu_exclusive=gpu_exclusive, max_runtime_s=max_runtime_s, title=title
-    ):
+    ) + list(job.get("warnings") or []):
         err_console.print(f"[yellow]note:[/yellow] {warning}")
 
     if not wait:

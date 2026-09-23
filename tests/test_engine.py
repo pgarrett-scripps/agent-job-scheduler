@@ -391,6 +391,17 @@ class TestQueueManagement:
         with pytest.raises(ValueError, match="would never run"):
             engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", after_ok=[a.id])
 
+    async def test_dependencies_that_will_not_wait_are_flagged(self, engine):
+        done = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")
+        await drive(engine, done.id)
+        engine.paused = True
+        held = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", held=True)
+        live = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")
+        warnings = engine.dependency_warnings([done.id], [held.id, live.id])
+        assert len(warnings) == 2
+        assert f"{done.id} already ended done" in warnings[0]
+        assert f"{held.id} is held" in warnings[1]
+
     async def test_hold_records_actor_and_reason(self, engine):
         engine.paused = True
         job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")
