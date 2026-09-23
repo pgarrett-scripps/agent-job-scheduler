@@ -236,6 +236,11 @@ def plan(
 
     reservation: Reservation | None = None
 
+    # A running exclusive job is charged the whole machine, so every job behind it
+    # fails the fit test. Say so, rather than blaming whatever small foreign load
+    # happens to be present.
+    holder = next((j for j in running if j.resources.exclusive), None)
+
     for job in order_queue(queued, last_start):
         need = effective_request(job, cap)
 
@@ -268,7 +273,11 @@ def plan(
         external = _external_for(job, external_usage)
         pool = free_exclusive if job.resources.exclusive else free
         if not _fits(need, pool):
-            outside = _external_note(external)
+            outside = (
+                f" (machine held by exclusive job #{holder.id}, {holder.project})"
+                if holder is not None
+                else _external_note(external)
+            )
             if reservation is None:
                 reservation = _reserve(job, need, cap, now, holds=holds, static={**leases, **external})
                 decision.reservation = reservation
@@ -277,8 +286,10 @@ def plan(
                         f"waiting for resources{outside}; "
                         f"reserved to start by {reservation.start_at - now:.0f}s from now"
                     )
-                elif outside:
+                elif holder is None and outside:
                     decision.blocked[job.id] = f"waiting for load outside ajs to drop{outside}; no reservation possible"
+                elif holder is not None:
+                    decision.blocked[job.id] = f"waiting for resources{outside}"
                 else:
                     decision.blocked[job.id] = "waiting for a lease to be released; no reservation possible"
             else:

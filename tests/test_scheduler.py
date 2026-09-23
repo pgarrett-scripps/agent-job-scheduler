@@ -64,6 +64,13 @@ class TestExclusive:
         assert decision.start == [1]
         assert 2 in decision.blocked
 
+    def test_blocked_reason_names_the_running_exclusive_job(self, cap, cfg):
+        # Small foreign load must not be blamed when an exclusive job holds everything.
+        running = [make_job(1, exclusive=True, state=JobState.RUNNING, started_at=NOW)]
+        decision = run_plan([make_job(2, cpu=1)], running, cap=cap, cfg=cfg, external_usage={"mem_mb": 3480})
+        assert "machine held by exclusive job #1" in decision.blocked[2]
+        assert "outside ajs" not in decision.blocked[2]
+
     def test_settle_period_delays_the_start(self, cap, cfg):
         # Machine just went quiet, so the measurement would still be perturbed.
         decision = run_plan([make_job(1, exclusive=True)], cap=cap, cfg=cfg, last_finish_at=NOW - 2)
