@@ -765,6 +765,9 @@ def ps_cmd(
 INBOX_FIRST_LOOK_S = 3600
 """How far back a session's first inbox check looks, so it is not flooded with history."""
 
+HOOK_TIMEOUT_S = 2.0
+"""Deadline for the inbox hook, which every prompt waits on."""
+
 
 def _inbox_cursor_path(session_id: str) -> Path:
     safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in session_id)
@@ -836,7 +839,9 @@ def inbox(
     else:
         start = float(cursor.get("since") or time.time() - INBOX_FIRST_LOOK_S)
     try:
-        box = _client().inbox(session, start)
+        # The hook runs before every prompt: a stuck daemon may delay it by seconds,
+        # never by the ordinary 30 s call deadline.
+        box = (Client(timeout=HOOK_TIMEOUT_S) if hook else _client()).inbox(session, start)
     except (protocol.SchedulerError, OSError) as exc:
         if hook:
             return  # a missing daemon must never break the agent's prompt

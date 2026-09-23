@@ -314,6 +314,29 @@ class TestMemoryGuard:
         assert decision.start == [1, 2]
         assert "memory guard" in decision.blocked[3]
 
+    def test_a_big_job_blocked_by_the_guard_is_not_starved_by_small_ones(self, cap, cfg):
+        """Smaller jobs behind it may only backfill if they end before its reserved start."""
+        running = [make_job(9, mem_mb=6000, state=JobState.RUNNING, started_at=NOW, max_runtime_s=600)]
+        jobs = [
+            make_job(1, mem_mb=8000, submitted_at=NOW),
+            make_job(2, mem_mb=1000, submitted_at=NOW + 1, max_runtime_s=3600),
+            make_job(3, mem_mb=1000, submitted_at=NOW + 2, max_runtime_s=300),
+        ]
+        decision = run_plan(jobs, running, cap=cap, cfg=cfg, mem_headroom_mb=5000)
+        assert decision.reservation is not None
+        assert decision.reservation.job_id == 1
+        assert decision.reservation.start_at == NOW + 600
+        assert "reserved to start" in decision.blocked[1]
+        assert "would delay reserved job #1" in decision.blocked[2]
+        assert decision.start == [3]
+
+    def test_memory_held_outside_ajs_does_not_veto_backfill(self, cap, cfg):
+        running = [make_job(9, mem_mb=1000, state=JobState.RUNNING, started_at=NOW, max_runtime_s=600)]
+        jobs = [make_job(1, mem_mb=8000), make_job(2, mem_mb=1000, submitted_at=NOW + 1)]
+        decision = run_plan(jobs, running, cap=cap, cfg=cfg, mem_headroom_mb=2000)
+        assert decision.reservation is not None and decision.reservation.external
+        assert decision.start == [2]
+
     def test_unmeasured_memory_skips_the_check(self, cap, cfg):
         decision = run_plan([make_job(1, mem_mb=8000)], cap=cap, cfg=cfg, mem_headroom_mb=None)
         assert decision.start == [1]

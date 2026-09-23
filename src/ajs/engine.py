@@ -494,13 +494,15 @@ class Engine:
                 with contextlib.suppress(Exception):
                     rp.log_file.close()
 
-        now = time.time()
+        exited = time.time()
         # Keep the job's slots until its whole process tree is gone, not just the main
         # process; otherwise the next job starts on top of the dying workers.
         with contextlib.suppress(Exception):
             await self.executor.drain(rp)
         self.running.pop(job_id, None)
-        self.last_finish_at = time.time()
+        # Stamped after the drain, which can take many seconds: an `ajs inbox` answered
+        # meanwhile moves its cursor past the exit time and would never see this job.
+        now = self.last_finish_at = time.time()
 
         job = self.store.get_job(job_id)
         monitor = self.monitors.pop(job_id, None)
@@ -517,7 +519,7 @@ class Engine:
             except Exception:  # a warning must never stop a job being recorded
                 log.exception("memory underuse check failed for job %s", job_id)
         if monitor is not None:
-            report = monitor.finish(now)
+            report = monitor.finish(exited)
             fields["contended"] = 1 if report.contended else 0
             fields["contention_note"] = report.note
             seen = self.interference.get(job_id)
@@ -811,7 +813,11 @@ class Engine:
         growth = 0
         for job in running:
             monitor = self.monitors.get(job.id)
-            now_mb = (monitor.mem_now_mb if monitor is not None else None) or 0
+            # Page cache is left out: MemAvailable already counts it as free, so
+            # treating it as used would hide the job's real room to grow.
+            now_mb = 0
+            if monitor is not None:
+                now_mb = next((v for v in (monitor.mem_anon_now_mb, monitor.mem_now_mb) if v is not None), 0)
             growth += max(0, job.resources.mem_mb - now_mb)
         return available - growth - self.cfg.mem_guard_mb
 

@@ -157,6 +157,8 @@ class ContentionMonitor:
         self.cpu_cores_now: float | None = None
         """Cores the job used over the most recent tick, for `ajs top`."""
         self.mem_now_mb: int | None = None
+        self.mem_anon_now_mb: int | None = None
+        """The job's own memory right now, without reclaimable page cache."""
         self.mem_peak_mb: int | None = None
         """Most anonymous memory the job has held, for telling owners they reserved too
         much. Page cache is left out: it grows to fill any limit and is reclaimable."""
@@ -210,6 +212,7 @@ class ContentionMonitor:
         # make every reservation look fully used. The kernel keeps no high-water mark
         # for anonymous memory alone, so the largest sampled value has to do.
         anon = cgroup_anon_bytes(self._cgroup) if self._cgroup is not None else None
+        self.mem_anon_now_mb = anon // (1024 * 1024) if anon is not None else None
         if anon is not None:
             anon_mb = anon // (1024 * 1024)
             if self.mem_peak_mb is None or anon_mb > self.mem_peak_mb:

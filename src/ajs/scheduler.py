@@ -326,10 +326,18 @@ def plan(
 
         real_mem = max(0, job.resources.mem_mb)
         if mem_headroom_mb is not None and real_mem > mem_headroom_mb:
-            decision.blocked[job.id] = (
+            why = (
                 f"memory guard: needs {real_mem} MB but only {max(0, mem_headroom_mb)} MB is really free "
                 f"after running jobs' room to grow and the {cfg.mem_guard_mb} MB guard"
             )
+            if reservation is None:
+                # Without a reservation, smaller jobs behind it would keep taking the
+                # memory it is waiting for, and a big job could wait forever.
+                reservation = _reserve_memory(job, need, now, holds=holds, headroom_mb=mem_headroom_mb)
+                decision.reservation = reservation
+                if not reservation.external:
+                    why += f"; reserved to start by {reservation.start_at - now:.0f}s from now"
+            decision.blocked[job.id] = why
             continue
 
         if job.resources.exclusive:
@@ -390,6 +398,31 @@ def _external_note(external_usage: dict[str, int] | None) -> str:
     if external_usage.get("gpu_mem_mb"):
         parts.append(f"{external_usage['gpu_mem_mb']} MB VRAM")
     return f" ({', '.join(parts)} in use outside ajs)" if parts else ""
+
+
+def _reserve_memory(
+    job: Job,
+    need: dict[str, int],
+    now: float,
+    *,
+    holds: list[tuple[dict[str, int], float]],
+    headroom_mb: int,
+) -> Reservation:
+    """Earliest time ``job`` passes the memory guard, assuming every hold lasts its
+    full term.
+
+    A job that ends gives back at least what it declared: the memory it uses plus the
+    room to grow that the headroom already sets aside for it. If that is still not
+    enough once everything has ended, memory outside ajs is the binding constraint and
+    the reservation is ``external``, so it does not veto backfill.
+    """
+    headroom = headroom_mb
+    for held, release_at in sorted(holds, key=lambda h: h[1]):
+        headroom += held.get("mem_mb", 0)
+        if job.resources.mem_mb <= headroom:
+            return Reservation(job_id=job.id, start_at=release_at, needs=need)
+    latest = max((release_at for _, release_at in holds), default=now)
+    return Reservation(job_id=job.id, start_at=latest, needs=need, external=True)
 
 
 def _reserve(

@@ -601,3 +601,32 @@ def test_mem_check_after_never_raises(value, expected):
     from ajs.engine import mem_check_after
 
     assert mem_check_after(value, 300) == expected
+
+
+def test_headroom_leaves_page_cache_out_of_a_jobs_use(engine, monkeypatch):
+    """MemAvailable already counts page cache as free; counting it as used too would
+    hide how much a running job can still grow."""
+    from ajs import sysinfo
+    from ajs.contention import ContentionMonitor
+
+    monkeypatch.setattr(sysinfo, "available_mem_mb", lambda: 20000)
+    job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", mem_mb=4000)
+    monitor = ContentionMonitor(2.0)
+    monitor.mem_now_mb, monitor.mem_anon_now_mb = 4000, 1000  # 3 GB of it is cache
+    engine.monitors[job.id] = monitor
+    engine.cfg.mem_guard_mb = 0
+    assert engine._mem_headroom([job]) == 20000 - 3000
+
+
+async def test_finish_time_is_stamped_after_the_process_tree_drains(engine, monkeypatch):
+    """An inbox check during the drain must not move its cursor past the job's end."""
+    during = {}
+
+    async def slow_drain(rp):
+        await asyncio.sleep(0.3)
+        during["at"] = time.time()
+
+    monkeypatch.setattr(engine.executor, "drain", slow_drain)
+    job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")
+    result = await drive(engine, job.id)
+    assert result["finished_at"] >= during["at"]
