@@ -280,8 +280,12 @@ class Engine:
                 rp.log_file.close()
 
         now = time.time()
+        # Keep the job's slots until its whole process tree is gone, not just the main
+        # process; otherwise the next job starts on top of the dying workers.
+        with contextlib.suppress(Exception):
+            await self.executor.drain(rp)
         self.running.pop(job_id, None)
-        self.last_finish_at = now
+        self.last_finish_at = time.time()
 
         job = self.store.get_job(job_id)
         monitor = self.monitors.pop(job_id, None)

@@ -31,6 +31,10 @@ log = logging.getLogger("ajs.executor")
 #: than a short delay (see ``_await_cgroup``).
 CGROUP_SETTLE_TIMEOUT_S = 3.0
 
+#: How long a job's leftover processes get to exit after its main process has, first on
+#: their own and then after SIGTERM, before they are SIGKILLed.
+DRAIN_GRACE_S = 10.0
+
 
 @dataclass(slots=True)
 class RunningProcess:
@@ -56,6 +60,7 @@ class Executor:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.tag = tag if tag is not None else instance_tag()
         self.unit_prefix = f"ajs-{self.tag}-job-"
+        self.drain_grace_s = DRAIN_GRACE_S
         if use_systemd is None:
             use_systemd = cfg.use_systemd and sysinfo.has_systemd_run()
             if cfg.use_systemd and not use_systemd:
@@ -180,9 +185,70 @@ class Executor:
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(rp.proc.wait(), timeout=5.0)
 
+    @staticmethod
+    def is_empty(rp: RunningProcess) -> bool:
+        """True once nothing the job started is still alive.
+
+        The main process exiting is not enough: a shell wrapper dies on SIGTERM at once
+        while the workers it spawned keep running, and a job can leave background children
+        behind on a normal exit. Their cores are still in use until they are gone.
+        """
+        # Only a scope's cgroup is the job's alone; without systemd, rp.cgroup is the
+        # daemon's own, which is never empty.
+        if rp.unit and rp.cgroup is not None:
+            try:
+                return not (rp.cgroup / "cgroup.procs").read_text().strip()
+            except OSError:
+                return True  # systemd removes the cgroup once the scope is empty
+        try:
+            os.killpg(rp.proc.pid, 0)  # start_new_session: the job's pgid is its pid
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            return False
+        return False
+
+    async def drain(self, rp: RunningProcess, *, grace_s: float | None = None) -> bool:
+        """After the main process exits, make sure everything it started is gone too.
+
+        Waits ``grace_s`` for leftovers to finish, then SIGTERMs them, waits again, then
+        SIGKILLs. Returns False if something survived even that (it escaped the process
+        group, or is stuck in the kernel); the caller frees the slots anyway, since a job
+        that never drains must not wedge the queue forever.
+        """
+        if grace_s is None:
+            grace_s = self.drain_grace_s
+        if await self._wait_empty(rp, grace_s):
+            return True
+        log.warning("job %s: main process exited but its children are still running; stopping them", rp.job_id)
+        if rp.unit:
+            await self._systemctl("stop", "--no-block", rp.unit)
+        else:
+            self._signal_group(rp, signal.SIGTERM)
+        if await self._wait_empty(rp, grace_s):
+            return True
+        if rp.unit:
+            await self._systemctl("kill", "--signal=SIGKILL", rp.unit)
+        else:
+            self._signal_group(rp, signal.SIGKILL)
+        if await self._wait_empty(rp, 5.0):
+            return True
+        log.error("job %s: processes survived SIGKILL; freeing its slots anyway", rp.job_id)
+        return False
+
+    async def _wait_empty(self, rp: RunningProcess, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while not self.is_empty(rp):
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(0.1)
+        return True
+
     def _signal_group(self, rp: RunningProcess, sig: int) -> None:
+        # The pgid is the main pid (start_new_session), and stays valid after the main
+        # process is reaped as long as any member lives: os.getpgid(pid) would not.
         with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(os.getpgid(rp.proc.pid), sig)
+            os.killpg(rp.proc.pid, sig)
 
     async def _systemctl(self, *args: str) -> None:
         with contextlib.suppress(OSError):

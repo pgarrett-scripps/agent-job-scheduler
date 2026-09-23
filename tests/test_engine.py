@@ -1,6 +1,7 @@
 """End-to-end: the engine really launches processes and reaps them."""
 
 import asyncio
+import os
 from pathlib import Path
 
 import pytest
@@ -116,6 +117,39 @@ class TestCancellation:
         assert await engine.cancel(job.id)
         await asyncio.sleep(0.3)
         assert engine.store.get_job(job.id).state is JobState.CANCELLED
+
+    async def test_cancel_holds_slots_until_children_die(self, engine, tmp_path):
+        # A wrapper that ignores nothing but whose child traps SIGTERM for a moment, like
+        # a worker flushing on shutdown: the slot must stay taken until the child is gone.
+        pidfile = tmp_path / "child.pid"
+        script = f"sh -c 'trap \"sleep 0.5; exit 0\" TERM; echo $$ > {pidfile}; while :; do sleep 0.05; done' & wait"
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/sh", "-c", script], cwd="/tmp", cpu=4)
+        async with asyncio.timeout(5):
+            while not pidfile.exists() or not pidfile.read_text().strip():
+                await engine.tick()
+                await asyncio.sleep(0.05)
+        child = int(pidfile.read_text())
+        await engine.cancel(job.id)
+        result = await drive(engine, job.id)
+        assert result["state"] == "cancelled"
+        with pytest.raises(ProcessLookupError):
+            os.kill(child, 0)
+        assert job.id not in engine.running
+
+    async def test_leftover_background_children_are_reaped(self, engine):
+        engine.executor.drain_grace_s = 0.3
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/sh", "-c", "sleep 60 & exit 0"], cwd="/tmp")
+        async with asyncio.timeout(5):
+            while engine.store.get_job(job.id).state is JobState.QUEUED:
+                await engine.tick()
+                await asyncio.sleep(0.02)
+            rp = engine.running[job.id]
+            await rp.proc.wait()
+            await asyncio.sleep(0.1)
+            assert job.id in engine.running, "slots freed while the background sleep still ran"
+        result = await drive(engine, job.id)
+        assert result["state"] == "done"
+        assert engine.executor.is_empty(rp)
 
     async def test_cancel_a_queued_job(self, engine):
         blocker = engine.submit(project="a", session_id="s", cmd=["/bin/sleep", "60"], cwd="/tmp", cpu=4)
