@@ -88,6 +88,7 @@ _ADDED_COLUMNS = (
     ("title", "TEXT"),
     ("meta", "TEXT NOT NULL DEFAULT '{}'"),
     ("hold_until", "REAL"),
+    ("deps", "TEXT NOT NULL DEFAULT '{}'"),  # {"ok": [ids], "any": [ids]}
 )
 
 
@@ -134,13 +135,15 @@ class Store:
         meta: dict[str, str] | None = None,
         held: bool = False,
         hold_until: float | None = None,
+        after_ok: list[int] | None = None,
+        after_any: list[int] | None = None,
     ) -> Job:
         now = time.time()
         cur = self.conn.execute(
             """INSERT INTO jobs
                (project, session_id, cmd, cwd, env, resources, max_runtime_s, job_class, state, submitted_at,
-                title, note, meta, held, hold_until)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                title, note, meta, held, hold_until, deps)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (
                 project,
                 session_id,
@@ -157,6 +160,7 @@ class Store:
                 json.dumps(meta or {}),
                 int(held),
                 hold_until,
+                json.dumps({"ok": list(after_ok or []), "any": list(after_any or [])}),
             ),
         )
         job_id = int(cur.lastrowid or 0)
@@ -300,6 +304,8 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         cancel_reason=row["cancel_reason"],
         held=bool(row["held"]),
         hold_until=row["hold_until"],
+        after_ok=[int(i) for i in json.loads(row["deps"] or "{}").get("ok", [])],
+        after_any=[int(i) for i in json.loads(row["deps"] or "{}").get("any", [])],
         title=row["title"],
         description=row["note"],
         meta=json.loads(row["meta"] or "{}"),

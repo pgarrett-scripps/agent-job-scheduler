@@ -359,6 +359,38 @@ class TestQueueManagement:
         assert (await drive(engine, job.id))["state"] == "done"
         assert engine.paused is False and engine.pause_until is None
 
+    async def test_after_ok_waits_then_runs(self, engine):
+        first = engine.submit(project="p", session_id="s", cmd=["/bin/sleep", "0.3"], cwd="/tmp")
+        second = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", after_ok=[first.id])
+        await engine.tick()
+        assert engine.store.get_job(second.id).state is JobState.QUEUED
+        assert engine.blocked_reason(second.id).startswith(f"waiting on job {first.id}")
+        assert (await drive(engine, second.id))["state"] == "done"
+        a, b = engine.store.get_job(first.id), engine.store.get_job(second.id)
+        assert b.started_at >= a.finished_at
+
+    async def test_failed_dependency_cancels_the_whole_chain(self, engine):
+        a = engine.submit(project="p", session_id="s", cmd=["/bin/false"], cwd="/tmp")
+        b = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", after_ok=[a.id])
+        c = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", after_ok=[b.id])
+        result = await drive(engine, c.id)
+        assert result["state"] == "cancelled"
+        assert engine.store.get_job(b.id).cancel_reason == f"dependency {a.id} ended failed"
+        assert engine.store.get_job(b.id).started_at is None
+
+    async def test_after_any_runs_even_if_dependency_fails(self, engine):
+        a = engine.submit(project="p", session_id="s", cmd=["/bin/false"], cwd="/tmp")
+        b = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", after_any=[a.id])
+        assert (await drive(engine, b.id))["state"] == "done"
+
+    async def test_dependency_must_exist_and_be_viable(self, engine):
+        with pytest.raises(ValueError, match="no such job"):
+            engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", after_ok=[999])
+        a = engine.submit(project="p", session_id="s", cmd=["/bin/false"], cwd="/tmp")
+        await drive(engine, a.id)
+        with pytest.raises(ValueError, match="would never run"):
+            engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", after_ok=[a.id])
+
     async def test_hold_records_actor_and_reason(self, engine):
         engine.paused = True
         job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")

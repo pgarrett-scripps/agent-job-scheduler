@@ -131,6 +131,10 @@ class Job:
     # not a lifecycle state: it can be flipped back and forth while the job waits.
     held: bool = False
     hold_until: float | None = None
+    # Dependencies: start only after these jobs finish. `after_ok` ones must succeed, or
+    # this job is cancelled; `after_any` ones just have to end.
+    after_ok: list[int] = field(default_factory=list)
+    after_any: list[int] = field(default_factory=list)
     """A timed hold: the daemon releases the job by itself at this epoch time."""
     # Submitter-supplied description, so whoever manages the queue can tell a paper's last
     # missing figure from an exploratory sweep. All optional and never interpreted.
@@ -184,6 +188,8 @@ class Job:
             "cancel_reason": self.cancel_reason,
             "held": self.held,
             "hold_until": self.hold_until,
+            "after_ok": self.after_ok,
+            "after_any": self.after_any,
             "title": self.title,
             "description": self.description,
             "meta": self.meta,

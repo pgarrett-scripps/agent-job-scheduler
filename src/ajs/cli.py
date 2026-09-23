@@ -227,6 +227,14 @@ def submit(
     after: Annotated[
         str, typer.Option("--after", help="Do not start before this: 5h, 22:30 or 2026-09-23 08:00.")
     ] = "",
+    after_ok: Annotated[
+        list[int] | None,
+        typer.Option("--after-ok", help="Start only once this job succeeds; cancelled if it fails. Repeatable."),
+    ] = None,
+    after_any: Annotated[
+        list[int] | None,
+        typer.Option("--after-any", help="Start only once this job ends, however it ends. Repeatable."),
+    ] = None,
     env: Annotated[
         list[str] | None,
         typer.Option("--env", "-e", help="Extra environment for the job: KEY=VALUE, or KEY to copy from your shell."),
@@ -276,6 +284,8 @@ def submit(
             **({"meta": meta_map} if meta_map else {}),
             **({"held": True} if hold else {}),
             **({"hold_until": hold_until} if hold_until is not None else {}),
+            **({"after_ok": list(after_ok)} if after_ok else {}),
+            **({"after_any": list(after_any)} if after_any else {}),
         )
     except protocol.SchedulerError as exc:
         _fail(str(exc))
@@ -486,8 +496,13 @@ def job_cmd(
         needs += ", exclusive"
     console.print(f"  needs:   {needs}, max {job['max_runtime_s'] // 60}m")
     console.print(f"  by:      {short_actor(job.get('session_id') or '-')}  cwd {job.get('cwd', '-')}")
+    for key, label in (("after_ok", "after ok"), ("after_any", "after any")):
+        if job.get(key):
+            console.print(f"  {label}: {', '.join(map(str, job[key]))}")
     if job.get("blocked_reason"):
         console.print(f"  waiting: {job['blocked_reason']}")
+    if job.get("cancel_reason"):
+        console.print(f"  ended:   {job['cancel_reason']}")
 
 
 @app.command()
@@ -698,6 +713,9 @@ def ps_cmd(
         mark = " [yellow]!contended[/yellow]" if job.get("contended") else ""
         if job.get("held") and state == "queued":
             mark += " [yellow]held[/yellow]"
+        deps = (job.get("after_ok") or []) + (job.get("after_any") or [])
+        if deps and state == "queued":
+            mark += f" [dim]after {','.join(map(str, deps))}[/dim]"
         table.add_row(
             str(job["id"]),
             f"[{colours.get(state, 'white')}]{state}[/{colours.get(state, 'white')}]{mark}",

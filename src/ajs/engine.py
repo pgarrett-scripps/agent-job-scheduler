@@ -41,6 +41,8 @@ class Engine:
         self.external = ExternalLoad(half_life_s=cfg.external_load_half_life_s)
         self.paused = False
         self.pause_until: float | None = None
+        self.dep_waiting: dict[int, str] = {}
+        """Queued jobs whose dependencies have not finished yet, and what they wait on."""
         """Set by `ajs pause --for`: the tick resumes by itself at this epoch time."""
         self.draining = False
         self._waiters: dict[int, list[asyncio.Future[None]]] = {}
@@ -106,20 +108,22 @@ class Engine:
         self._enforce_runtime_limits(now)
         self._enforce_disk_floor()
         self._expire_timed_holds(now)
+        self._resolve_dependencies(now)
 
         if self.paused or self.draining:
             self.last_decision = Decision(
                 blocked={
                     j.id: "scheduler is paused" if self.paused else "scheduler is draining"
                     for j in self.store.jobs_in_state(JobState.QUEUED)
-                    if not j.held
+                    if not j.held and j.id not in self.dep_waiting
                 }
             )
             return
 
-        # Held jobs are invisible to the planner: they neither start nor claim the
-        # reservation, so holding a starved giant also stops it vetoing backfill.
-        queued = [j for j in self.store.jobs_in_state(JobState.QUEUED) if not j.held]
+        # Held jobs, and jobs still waiting on dependencies, are invisible to the planner:
+        # they neither start nor claim the reservation, so holding a starved giant also
+        # stops it vetoing backfill.
+        queued = [j for j in self.store.jobs_in_state(JobState.QUEUED) if not j.held and j.id not in self.dep_waiting]
         running = self.store.jobs_in_state(JobState.RUNNING)
         if not queued:
             self.last_decision = Decision()
@@ -203,6 +207,32 @@ class Engine:
             if job.held and job.hold_until is not None and now >= job.hold_until:
                 self.store.update_job(job.id, held=0, hold_until=None)
                 self.store.add_event(job.id, actor="ajs", action="release", reason="timed hold expired")
+
+    def _resolve_dependencies(self, now: float) -> None:
+        """Work out which queued jobs are still waiting on others, and cancel the ones
+        whose `after_ok` dependency failed. Jobs are visited in id order and dependencies
+        always have lower ids, so a failure cascades down a whole chain in one pass."""
+        waiting: dict[int, str] = {}
+        for job in self.store.jobs_in_state(JobState.QUEUED):
+            pending, doomed = [], None
+            for dep_id, must_succeed in [(i, True) for i in job.after_ok] + [(i, False) for i in job.after_any]:
+                dep = self.store.get_job(dep_id)
+                if dep is None:
+                    doomed = f"dependency {dep_id} no longer exists"
+                    break
+                if not dep.state.is_terminal:
+                    pending.append(f"{dep_id} ({dep.state})")
+                elif must_succeed and dep.state is not JobState.DONE:
+                    doomed = f"dependency {dep_id} ended {dep.state}"
+                    break
+            if doomed is not None:
+                log.info("cancelling job %s: %s", job.id, doomed)
+                self.store.update_job(job.id, state=str(JobState.CANCELLED), finished_at=now, cancel_reason=doomed)
+                self.store.add_event(job.id, actor="ajs", action="cancel", reason=doomed)
+                self._notify(job.id)
+            elif pending:
+                waiting[job.id] = "waiting on job " + ", ".join(pending)
+        self.dep_waiting = waiting
 
     def _enforce_runtime_limits(self, now: float) -> None:
         """Kill jobs that blew past the max_runtime they declared.
@@ -359,7 +389,17 @@ class Engine:
         note: str | None = None,
         held: bool = False,
         hold_until: float | None = None,
+        after_ok: list[int] | None = None,
+        after_any: list[int] | None = None,
     ) -> Job:
+        after_ok = [int(i) for i in after_ok or []]
+        after_any = [int(i) for i in after_any or []]
+        for dep_id in after_ok + after_any:
+            dep = self.store.get_job(dep_id)
+            if dep is None:
+                raise ValueError(f"no such job to depend on: {dep_id}")
+            if dep_id in after_ok and dep.state.is_terminal and dep.state is not JobState.DONE:
+                raise ValueError(f"job {dep_id} already ended {dep.state}; --after-ok on it would never run")
         resources = ResourceRequest(
             cpu=cpu,
             mem_mb=mem_mb,
@@ -385,6 +425,8 @@ class Engine:
             meta={str(k): str(v) for k, v in (meta or {}).items()},
             held=held or hold_until is not None,
             hold_until=hold_until,
+            after_ok=after_ok,
+            after_any=after_any,
         )
         if held or hold_until is not None:
             detail = f"until {_clock(hold_until)}" if hold_until is not None else ""
@@ -480,6 +522,8 @@ class Engine:
         if reason is not None:
             return reason
         job = self.store.get_job(job_id)
+        if job is not None and not job.held and job_id in self.dep_waiting:
+            return self.dep_waiting[job_id]
         if job is not None and job.held:
             event = self.store.last_event(job_id, "hold")
             if event is None:

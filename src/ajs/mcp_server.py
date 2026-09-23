@@ -61,8 +61,10 @@ does not need all 20 cores. Set both only if the job genuinely needs both.
 Split long runs. If a job would run over about 30 minutes and the work divides (per
 file, per sample, per parameter set), submit resumable chunks that each write their own
 output, rather than one multi-hour job. Other agents' jobs can then start between your
-chunks instead of waiting hours. Never use exclusive=true for throughput: it drains the
-whole machine first. Submissions that look like either pattern come back with `warnings`.
+chunks instead of waiting hours. When chunks must run in order, chain them with
+`after_ok`: each waits for the previous one, and a failure cancels the rest. Never use
+exclusive=true for throughput: it drains the whole machine first. Submissions that look
+like either pattern come back with `warnings`.
 
 Pass `title` and `description` with every submission: a short name, and one line on
 what the job is for and what it unblocks. Add `meta` for anything else worth knowing,
@@ -115,6 +117,8 @@ def build_server() -> Any:
         meta: dict[str, str] | None = None,
         note: str = "",
         start_after: str = "",
+        after_ok: list[int] | None = None,
+        after_any: list[int] | None = None,
     ) -> dict[str, Any]:
         """Queue a command and return immediately with a job id.
 
@@ -159,6 +163,10 @@ def build_server() -> Any:
             note: older name for `description`; still accepted.
             start_after: do not start before this: "5h", "22:30" or "2026-09-23 08:00".
                 The job is queued held and released by the daemon at that time.
+            after_ok: job ids that must finish successfully first. If one fails or is
+                cancelled, this job is cancelled too. Use it to chain the chunks of a
+                split-up long run, so a failure stops the rest instead of burning them.
+            after_any: job ids that must finish first, however they end.
         """
         try:
             work_dir = cwd or os.getcwd()
@@ -182,6 +190,8 @@ def build_server() -> Any:
                 **({"description": description or note} if description or note else {}),
                 **({"meta": {str(k): str(v) for k, v in meta.items()}} if meta else {}),
                 **({"hold_until": parse_when(start_after)} if start_after else {}),
+                **({"after_ok": list(after_ok)} if after_ok else {}),
+                **({"after_any": list(after_any)} if after_any else {}),
             )
             result: dict[str, Any] = {"ok": True, "job_id": job["id"], "state": job["state"]}
             warnings = submission_warnings(
@@ -401,6 +411,8 @@ def _summarise(job: dict[str, Any]) -> dict[str, Any]:
         "class",
         "held",
         "hold_until",
+        "after_ok",
+        "after_any",
         "title",
         "description",
         "meta",
