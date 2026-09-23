@@ -306,6 +306,21 @@ Phases 0-4 are implemented and tested. `ajs top` is the live view; `ajs status` 
 snapshot for scripts and agents. Not built: learned per-command resource defaults -- see
 below.
 
+## Known bugs
+
+- **A job's resources are freed before its children are dead.** `Executor.stop()` and
+  `Engine._supervise()` treat the job as finished when the top-level process exits, not when
+  its cgroup is empty. A shell wrapper dies on SIGTERM at once, while the workers it spawned
+  keep running inside the scope until systemd finishes stopping it. Seen 2026-09-22: cancelling
+  job 172 (a 20-core Casanovo run under `run_cpu.sh`) marked it cancelled at 17:23:37 and started
+  jobs 209 and 210 in the same tick. The scope only stopped at 17:23:58, so for 21 s two 8-core
+  jobs ran on top of 20 cores of dying Casanovo. The same gap applies to a normal exit that
+  leaves background children behind, and it makes the exclusive settle period start too early.
+  Fix: after the main process exits, wait for the scope to go inactive (poll
+  `systemctl --user is-active` or the cgroup's `cgroup.procs`), send SIGKILL to the unit after the
+  grace period, and only then free resources and set `last_finish_at`. The process-group
+  fallback needs the same wait on `killpg(pgid, 0)`.
+
 ## Open questions
 
 - **Declared vs. measured resources.** Agents will guess `cpu: 8` badly. Phase 3's cgroup accounting
