@@ -16,6 +16,7 @@ which is exactly the quantity that invalidates a benchmark.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -394,34 +395,63 @@ class ForeignProcess:
     name: str
     cwd: str
     cores: float
+    rss_mb: int = 0
 
     def describe(self) -> str:
         where = f" in {self.cwd}" if self.cwd else ""
-        return f"pid {self.pid} {self.name}{where} at {self.cores:.1f} cores"
+        return f"pid {self.pid} {self.name}{where} at {self.cores:.1f} cores, {self.rss_mb / 1024:.1f} GB"
+
+    def to_dict(self) -> dict[str, object]:
+        return {"pid": self.pid, "name": self.name, "cwd": self.cwd, "cores": self.cores, "rss_mb": self.rss_mb}
+
+
+def short_cwd(cwd: str) -> str:
+    """Enough of a working directory to say whose process it is.
+
+    Agent scratch directories encode the repository in their name
+    (``/tmp/claude-1000/-home-me-Repos-koth-paper/<session>/scratchpad``), and the
+    repository is what identifies the owner, so that is all that is kept.
+    """
+    home = str(Path.home())
+    if "-Repos-" in cwd and cwd.startswith("/tmp/"):
+        repo = cwd.split("-Repos-", 1)[1].split("/", 1)[0]
+        return f"~/Repos/{repo} (scratch)"
+    if cwd.startswith(home):
+        cwd = "~" + cwd[len(home) :]
+    parts = cwd.split("/")
+    if cwd.startswith("~/Repos/") and len(parts) > 3:
+        return "/".join(parts[:3])
+    return cwd
+
+
+_PAGE_MB = os.sysconf("SC_PAGE_SIZE") / (1024 * 1024)
 
 
 class ForeignProcesses:
-    """Names the processes outside ajs that are using CPU.
+    """Names the processes outside ajs that are using CPU or memory.
 
-    `ExternalLoad` says *how much* foreign work there is; this says *whose*, so an
-    interference note can point at a PID and a repository instead of a number. It walks
-    /proc, so it is only run while a timing job needs the answer.
+    `ExternalLoad` says *how much* foreign work there is; this says *whose*, so a status
+    line or an interference note can point at a PID and a repository instead of a
+    number. It walks /proc, so the engine runs it every few seconds, not every tick.
     """
 
     def __init__(self) -> None:
         self._last: dict[int, float] = {}
         self._t: float | None = None
+        self.latest: list[ForeignProcess] = []
+        """Notable foreign processes from the most recent sample, in no set order."""
 
     @property
     def sampled_at(self) -> float | None:
         return self._t
 
     def sample(
-        self, now: float, own_cgroups: set[Path], *, top: int = 3, min_cores: float = 0.5
+        self, now: float, own_cgroups: set[Path], *, min_cores: float = 0.5, min_rss_mb: int = 1024
     ) -> list[ForeignProcess]:
-        """CPU use per foreign process since the previous call, busiest first."""
+        """Foreign processes using at least ``min_cores`` since the previous call, or
+        holding at least ``min_rss_mb`` of memory."""
         current: dict[int, float] = {}
-        names: dict[int, str] = {}
+        seen: dict[int, tuple[str, int]] = {}
         for entry in Path("/proc").iterdir():
             if not entry.name.isdigit():
                 continue
@@ -433,20 +463,20 @@ class ForeignProcesses:
             # The command name is in parentheses and may itself contain spaces.
             name = raw[raw.find("(") + 1 : raw.rfind(")")]
             fields = raw[raw.rfind(")") + 2 :].split()
-            if len(fields) < 13:
+            if len(fields) < 22:
                 continue
             current[pid] = (int(fields[11]) + int(fields[12])) / 100.0
-            names[pid] = name
+            seen[pid] = (name, int(int(fields[21]) * _PAGE_MB))
         previous, last_t = self._last, self._t
         self._last, self._t = current, now
-        if last_t is None or now <= last_t:
-            return []
-        dt = now - last_t
-        busy = []
+        dt = now - last_t if last_t is not None and now > last_t else None
+        notable = []
         for pid, cpu in current.items():
-            cores = (cpu - previous.get(pid, cpu)) / dt
-            if cores < min_cores:
+            cores = (cpu - previous.get(pid, cpu)) / dt if dt else 0.0
+            name, rss_mb = seen[pid]
+            if cores < min_cores and rss_mb < min_rss_mb:
                 continue
+            # Only now pay for the cgroup and cwd lookups: most processes are idle.
             cgroup = cgroup_path_for_pid(pid)
             if cgroup is not None and cgroup in own_cgroups:
                 continue
@@ -454,6 +484,13 @@ class ForeignProcesses:
                 cwd = str(Path(f"/proc/{pid}/cwd").readlink())
             except OSError:
                 cwd = ""
-            busy.append(ForeignProcess(pid, names[pid], cwd.replace(str(Path.home()), "~"), cores))
-        busy.sort(key=lambda p: p.cores, reverse=True)
-        return busy[:top]
+            notable.append(ForeignProcess(pid, name, short_cwd(cwd), cores, rss_mb))
+        self.latest = notable
+        return notable
+
+    def top_cpu(self, n: int = 3, *, min_cores: float = 0.5) -> list[ForeignProcess]:
+        busy = [p for p in self.latest if p.cores >= min_cores]
+        return sorted(busy, key=lambda p: p.cores, reverse=True)[:n]
+
+    def top_mem(self, n: int = 3) -> list[ForeignProcess]:
+        return sorted(self.latest, key=lambda p: p.rss_mb, reverse=True)[:n]

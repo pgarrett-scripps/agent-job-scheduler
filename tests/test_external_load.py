@@ -317,5 +317,29 @@ def test_foreign_processes_name_a_busy_process():
     end = _time.time() + 0.3
     while _time.time() < end:
         pass
-    busy = fp.sample(_time.time(), set(), top=50, min_cores=0.3)
+    busy = fp.sample(_time.time(), set(), min_cores=0.3)
     assert os.getpid() in {p.pid for p in busy}
+
+
+def test_foreign_processes_rank_by_cpu_and_memory():
+    from ajs.contention import ForeignProcess, ForeignProcesses
+
+    fp = ForeignProcesses()
+    fp.latest = [
+        ForeignProcess(1, "cc1", "", 1.0, 100),
+        ForeignProcess(2, "brave", "", 0.1, 4000),
+        ForeignProcess(3, "sage", "", 3.0, 2000),
+    ]
+    assert [p.pid for p in fp.top_cpu()] == [3, 1]
+    assert [p.pid for p in fp.top_mem(2)] == [2, 3]
+
+
+def test_short_cwd_names_the_repository():
+    from pathlib import Path
+
+    from ajs.contention import short_cwd
+
+    home = str(Path.home())
+    assert short_cwd(f"{home}/Repos/koth-lfq-paper/analysis/sub") == "~/Repos/koth-lfq-paper"
+    assert short_cwd("/tmp/claude-1000/-home-me-Repos-koth-paper/abc/scratchpad/e2e") == "~/Repos/koth-paper (scratch)"
+    assert short_cwd("/usr/bin") == "/usr/bin"

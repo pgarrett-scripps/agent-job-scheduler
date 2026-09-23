@@ -199,6 +199,8 @@ class Engine:
         self._own_cgroups = own_cgroups
         if self.cfg.track_external_load:
             self.external.sample(now, own_cpu, own_mem, own_cgroups)
+            if now - (self.foreign.sampled_at or 0.0) >= 5.0:
+                self.foreign.sample(now, own_cgroups)
             self._update_quiet(now)
 
     def _update_quiet(self, now: float) -> None:
@@ -231,8 +233,7 @@ class Engine:
         for job_id in timing:
             if loud_cpu and job_id not in self._interfering:
                 self._interfering.add(job_id)
-                who = self.foreign.sample(now, self._own_cgroups)
-                # The first /proc walk only sets a baseline; name the culprits on the next.
+                who = self.foreign.top_cpu()
                 line = time.strftime("%H:%M:%S", time.localtime(now)) + f" {self.noise}"
                 if who:
                     line += ": " + "; ".join(p.describe() for p in who)
@@ -241,9 +242,6 @@ class Engine:
                 log.warning("timing job %s disturbed: %s", job_id, line)
             elif not loud_cpu:
                 self._interfering.discard(job_id)
-        if timing and now - (self.foreign.sampled_at or 0.0) >= 5.0:
-            # Keep a fresh /proc baseline so the next episode can name its culprits.
-            self.foreign.sample(now, self._own_cgroups)
 
     def _is_timing(self, job_id: int) -> bool:
         return job_id in self._timing
@@ -654,6 +652,34 @@ class Engine:
             "disk_floor_mb": self.cfg.disk_floor_mb,
             "load": sysinfo.load_average(),
             "active_leases": len(self.store.active_leases()),
+            "measured": self._measured(running),
+        }
+
+    def _measured(self, running: list[Job]) -> dict[str, Any]:
+        """What the machine is really doing, split into ajs jobs and everything else.
+
+        Unlike ``used`` (declared reservations) and ``external`` (rounded, minus the
+        desktop allowance), these are raw measurements, so the two parts add up to what
+        `top` would show.
+        """
+        ajs_cpu = sum(m.cpu_cores_now or 0.0 for m in self.monitors.values())
+        ajs_mem = sum(m.mem_now_mb or 0 for m in self.monitors.values())
+        total_mem = sysinfo.total_mem_mb()
+        available = sysinfo.available_mem_mb()
+        return {
+            "cpu_ajs": ajs_cpu,
+            "cpu_outside": self.external.cpu_cores if self.external.ready else None,
+            "cpu_allowance": self.cfg.external_cpu_allowance,
+            "iowait_pct": self.external.iowait_pct if self.external.ready else None,
+            "mem_total_mb": total_mem,
+            "mem_used_mb": None if available is None else total_mem - available,
+            "mem_ajs_mb": ajs_mem,
+            "mem_outside_mb": self.external.mem_mb,
+            "mem_reserve_mb": self.cfg.mem_reserve_mb,
+            "quiet": self.quiet_since is not None,
+            "noise": self.noise,
+            "top_cpu": [p.to_dict() for p in self.foreign.top_cpu()],
+            "top_mem": [p.to_dict() for p in self.foreign.top_mem()],
         }
 
     def _with_usage(self, job: Job) -> dict[str, Any]:

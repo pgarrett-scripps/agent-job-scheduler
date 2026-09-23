@@ -536,6 +536,39 @@ def logs(
         return
 
 
+def _print_measured(m: dict[str, Any] | None) -> None:
+    """Real usage, split into ajs jobs and everything else.
+
+    Shown apart from the reservation line so it is obvious which cores are not ajs's
+    doing and will not be freed by cancelling a job.
+    """
+    if not m or m.get("cpu_outside") is None:
+        return
+    out_cpu, allow = m["cpu_outside"], m["cpu_allowance"]
+    cpu_colour = "yellow" if out_cpu > allow + 1 else "dim"
+    console.print(
+        f"[{cpu_colour}]measured cpu {m['cpu_ajs'] + out_cpu:.1f} cores busy = "
+        f"ajs jobs {m['cpu_ajs']:.1f} + outside {out_cpu:.1f} (desktop allowance {allow:.0f})   "
+        f"iowait {m['iowait_pct']:.0f}%[/{cpu_colour}]"
+    )
+    if m.get("mem_used_mb") is not None:
+        out_mem = m["mem_outside_mb"]
+        mem_colour = "yellow" if out_mem > m["mem_reserve_mb"] else "dim"
+        console.print(
+            f"[{mem_colour}]measured mem {m['mem_used_mb'] / 1024:.1f}/{m['mem_total_mb'] / 1024:.1f} GB = "
+            f"ajs jobs {m['mem_ajs_mb'] / 1024:.1f} + outside {out_mem / 1024:.1f} "
+            f"(desktop allowance {m['mem_reserve_mb'] / 1024:.0f})[/{mem_colour}]"
+        )
+    for label, rows in (("cpu", m.get("top_cpu") or []), ("mem", m.get("top_mem") or [])):
+        for r in rows:
+            console.print(
+                f"[dim]  outside top {label}: {r['name']} (pid {r['pid']}) {r['cores']:.1f} cores "
+                f"{r['rss_mb'] / 1024:.1f} GB  {r['cwd']}[/dim]"
+            )
+    if not m.get("quiet") and m.get("noise"):
+        console.print(f"[yellow]  not quiet enough to time on: {m['noise']}[/yellow]")
+
+
 @app.command(name="status")
 def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> None:
     """Show capacity, running jobs, and why queued jobs are waiting."""
@@ -566,16 +599,10 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
         f"({used.get('gpu_mem_mb', 0)}/{cap.get('gpu_mem_mb', 0)} MB)   "
         f"[bold]load[/bold] {data['load'][0]:.2f}   {header}"
     )
+    _print_measured(data.get("measured"))
     ext = data.get("external") or {}
     if ext.get("gpu_mem_mb"):
         console.print(f"[yellow]outside ajs[/yellow] {ext['gpu_mem_mb']} MB VRAM held by non-ajs processes")
-    if ext.get("cpu") or ext.get("mem_mb"):
-        # Shown separately from `used` so it is obvious these cores are not ajs's doing
-        # and will not be freed by cancelling a job.
-        console.print(
-            f"[dim]outside ajs {ext.get('cpu', 0)} cpu, {ext.get('mem_mb', 0)} MB "
-            f"beyond the desktop allowance; timing runs ignore this[/dim]"
-        )
     disk_colour = "red" if data["free_disk_mb"] < data["disk_floor_mb"] else "dim"
     console.print(
         f"[{disk_colour}]disk {data['free_disk_mb']} MB free (floor {data['disk_floor_mb']} MB)[/{disk_colour}]"
