@@ -559,6 +559,12 @@ def _print_measured(m: dict[str, Any] | None) -> None:
             f"ajs jobs {m['mem_ajs_mb'] / 1024:.1f} + outside {out_mem / 1024:.1f} "
             f"(desktop allowance {m['mem_reserve_mb'] / 1024:.0f})[/{mem_colour}]"
         )
+    if m.get("mem_headroom_mb") is not None:
+        head = m["mem_headroom_mb"]
+        console.print(
+            f"[{'yellow' if head < 4096 else 'dim'}]a new job can really have {max(0, head) / 1024:.1f} GB "
+            "(free now, less running jobs' room to grow and the guard)[/]"
+        )
     for label, rows in (("cpu", m.get("top_cpu") or []), ("mem", m.get("top_mem") or [])):
         for r in rows:
             console.print(

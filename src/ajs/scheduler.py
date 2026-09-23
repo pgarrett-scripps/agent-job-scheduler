@@ -186,6 +186,7 @@ def plan(
     quiet_since: float | None = 0.0,
     noise: str = "",
     settling_since: dict[int, float] | None = None,
+    mem_headroom_mb: int | None = None,
 ) -> Decision:
     """Decide which queued jobs may start right now.
 
@@ -200,6 +201,10 @@ def plan(
     ``quiet_since`` is when load outside ajs last dropped below the quiet limits, or None
     while it is still above them; ``noise`` says what is over. ``settling_since`` is when
     each exclusive job began holding the machine, to cap how long it waits for quiet.
+
+    ``mem_headroom_mb`` is memory really available to a new job: the kernel's
+    MemAvailable, less what running jobs may still grow into and the guard. None means
+    unmeasured and skips the check.
     """
     decision = Decision()
 
@@ -319,6 +324,14 @@ def plan(
                 )
                 continue
 
+        real_mem = max(0, job.resources.mem_mb)
+        if mem_headroom_mb is not None and real_mem > mem_headroom_mb:
+            decision.blocked[job.id] = (
+                f"memory guard: needs {real_mem} MB but only {max(0, mem_headroom_mb)} MB is really free "
+                f"after running jobs' room to grow and the {cfg.mem_guard_mb} MB guard"
+            )
+            continue
+
         if job.resources.exclusive:
             since_finish = now - last_finish_at if last_finish_at else float("inf")
             since_quiet = now - quiet_since if quiet_since is not None else 0.0
@@ -348,6 +361,8 @@ def plan(
                 take_locks(job_locks)
                 per_project[job.project] = per_project.get(job.project, 0) + 1
                 holds.append((need, now + remaining + job.max_runtime_s))
+                if mem_headroom_mb is not None:
+                    mem_headroom_mb -= real_mem
                 continue
 
         decision.start.append(job.id)
@@ -356,6 +371,8 @@ def plan(
         take_locks(job_locks)
         per_project[job.project] = per_project.get(job.project, 0) + 1
         holds.append((need, now + job.max_runtime_s))
+        if mem_headroom_mb is not None:
+            mem_headroom_mb -= real_mem
 
     return decision
 

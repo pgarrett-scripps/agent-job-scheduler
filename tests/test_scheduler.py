@@ -300,6 +300,25 @@ class TestCountedSemaphores:
         assert decision.start == [1]
 
 
+class TestMemoryGuard:
+    """Real free memory, not just declared reservations, gates a start."""
+
+    def test_blocks_when_really_free_memory_is_short(self, cap, cfg):
+        decision = run_plan([make_job(1, mem_mb=8000)], cap=cap, cfg=cfg, mem_headroom_mb=5000)
+        assert decision.start == []
+        assert "memory guard" in decision.blocked[1]
+
+    def test_each_start_uses_up_headroom(self, cap, cfg):
+        jobs = [make_job(i, mem_mb=4000, submitted_at=NOW + i) for i in range(1, 4)]
+        decision = run_plan(jobs, cap=cap, cfg=cfg, mem_headroom_mb=9000)
+        assert decision.start == [1, 2]
+        assert "memory guard" in decision.blocked[3]
+
+    def test_unmeasured_memory_skips_the_check(self, cap, cfg):
+        decision = run_plan([make_job(1, mem_mb=8000)], cap=cap, cfg=cfg, mem_headroom_mb=None)
+        assert decision.start == [1]
+
+
 class TestQuietGate:
     """An exclusive job waits for load outside ajs to drop, holding the machine meanwhile."""
 

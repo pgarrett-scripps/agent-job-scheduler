@@ -107,6 +107,15 @@ class Config:
     mem_reserve_mb: int = 6144
     """Held back from scheduling so the desktop does not swap while jobs run."""
 
+    mem_guard_mb: int = 2048
+    """Real free memory (MemAvailable) a job must leave untouched when it starts, after
+    setting aside what running jobs may still grow into up to their declared limits.
+
+    Declared reservations alone miss memory that is really gone: a process outside ajs
+    that grew since the last smoothed sample, or an exclusive job, which ignores foreign
+    load. This check uses the kernel's own number, so a start cannot push the machine
+    into the OOM killer however the bookkeeping looks."""
+
     disk_floor_mb: int = 5120
     """Hard floor on free disk. Jobs are refused admission below this. Protects the root
     filesystem from a job that writes large output.

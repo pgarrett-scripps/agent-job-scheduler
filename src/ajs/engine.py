@@ -156,6 +156,7 @@ class Engine:
             quiet_since=self.quiet_since if self.cfg.track_external_load else 0.0,
             noise=self.noise,
             settling_since=self.settling_since,
+            mem_headroom_mb=self._mem_headroom(running),
         )
         self.last_decision = decision
         self.settling_since = {j: self.settling_since.get(j, now) for j in decision.settling}
@@ -671,6 +672,20 @@ class Engine:
             "measured": self._measured(running),
         }
 
+    def _mem_headroom(self, running: list[Job]) -> int | None:
+        """Memory a new job can really have: MemAvailable, less what running jobs may
+        still grow into up to their declared limits, less the guard. A job whose usage
+        is unknown is assumed to still have all of its declared memory to come."""
+        available = sysinfo.available_mem_mb()
+        if available is None:
+            return None
+        growth = 0
+        for job in running:
+            monitor = self.monitors.get(job.id)
+            now_mb = (monitor.mem_now_mb if monitor is not None else None) or 0
+            growth += max(0, job.resources.mem_mb - now_mb)
+        return available - growth - self.cfg.mem_guard_mb
+
     def _measured(self, running: list[Job]) -> dict[str, Any]:
         """What the machine is really doing, split into ajs jobs and everything else.
 
@@ -692,6 +707,7 @@ class Engine:
             "mem_ajs_mb": ajs_mem,
             "mem_outside_mb": self.external.mem_mb,
             "mem_reserve_mb": self.cfg.mem_reserve_mb,
+            "mem_headroom_mb": self._mem_headroom(running),
             "quiet": self.quiet_since is not None,
             "noise": self.noise,
             "top_cpu": [p.to_dict() for p in self.foreign.top_cpu()],
