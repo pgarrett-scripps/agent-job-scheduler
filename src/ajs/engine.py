@@ -19,7 +19,7 @@ from . import sysinfo
 from .config import Config, db_path, log_dir
 from .contention import ContentionMonitor, ExternalLoad, ForeignProcesses
 from .db import Store
-from .executor import Executor, RunningProcess
+from .executor import Executor, RunningProcess, read_exit_file
 from .models import Job, JobClass, JobState, ResourceRequest, short_actor
 from .scheduler import Capacity, Decision, effective_request, plan
 
@@ -67,23 +67,64 @@ class Engine:
     async def recover(self) -> None:
         """Reconcile after a daemon restart.
 
-        Jobs marked RUNNING in the database have no supervising task any more, and their
-        cgroups may still be alive holding resources the scheduler no longer knows about.
-        Stop them and mark them failed rather than leaving phantom capacity consumed.
+        A job still alive in its own scope is adopted: supervised, monitored and charged
+        exactly as if this daemon had started it, so restarting ajs costs no work. A job
+        that ended while no daemon was watching is recorded from its exit file. Anything
+        else marked RUNNING is gone and is marked failed, and scopes no job claims are
+        stopped rather than left holding capacity the scheduler does not know about.
         """
-        stale = self.store.jobs_in_state(JobState.RUNNING)
-        for job in stale:
-            log.warning("recovering orphaned job %s from previous daemon life", job.id)
+        now = time.time()
+        adopted: set[str] = set()
+        for job in self.store.jobs_in_state(JobState.RUNNING):
+            rp = self.executor.adopt(job)
+            if rp is not None:
+                self._adopt(job, rp, now)
+                if rp.unit:
+                    adopted.add(rp.unit)
+                continue
+            exit_file = self.executor.exit_file(job.id)
+            code = read_exit_file(exit_file)
+            if code is not None:
+                ended = exit_file.stat().st_mtime
+                state = JobState.DONE if code == 0 else JobState.FAILED
+                if job.cancel_reason:
+                    state = JobState.TIMEOUT if "max_runtime" in job.cancel_reason else JobState.CANCELLED
+                log.info("job %s finished while the daemon was down: %s (exit=%s)", job.id, state, code)
+                self.store.update_job(job.id, state=str(state), finished_at=ended, exit_code=code)
+                self.last_finish_at = max(self.last_finish_at, ended)
+                continue
+            log.warning("job %s was lost while the daemon was down", job.id)
             self.store.update_job(
                 job.id,
                 state=str(JobState.FAILED),
-                finished_at=time.time(),
+                finished_at=now,
                 exit_code=None,
-                cancel_reason="daemon restarted while job was running",
+                cancel_reason="daemon restarted and the job's process was gone, with no exit status",
             )
         for unit in self.executor.orphan_units():
+            if unit in adopted:
+                continue
             log.warning("stopping orphaned unit %s", unit)
             await Executor.stop_unit(unit)
+
+    def _adopt(self, job: Job, rp: RunningProcess, now: float) -> None:
+        """Supervise a job a previous daemon started. Contention is measured from now
+        on; what happened before the restart went unwatched, and the job's history says so."""
+        monitor = ContentionMonitor(
+            self.cfg.contention_threshold,
+            assess=job.resources.exclusive or job.resources.gpu_exclusive,
+        )
+        monitor.start(rp.proc.pid, now, cgroup=rp.cgroup)
+        self.monitors[job.id] = monitor
+        if job.resources.exclusive:
+            self._timing.add(job.id)
+        self.running[job.id] = rp
+        detail = f"daemon restarted; job kept running, watched again from {_clock(now)}"
+        self.store.add_event(job.id, actor="ajs", action="adopt", detail=detail)
+        log.info("adopted running job %s (%s) in %s", job.id, job.project, rp.unit)
+        task = asyncio.create_task(self._supervise(job.id, rp))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
 
     async def run(self) -> None:
         """Main loop. Ticks on a timer or whenever something interesting happens."""
@@ -102,9 +143,17 @@ class Engine:
         self._wake.set()
 
     async def shutdown(self) -> None:
+        """Stop the daemon, leaving jobs in their own scopes running for the next one to
+        adopt. Jobs without a scope share the daemon's cgroup and would die with it
+        anyway, so those are stopped cleanly."""
         for task in list(self._tasks):
             task.cancel()
         for rp in list(self.running.values()):
+            if rp.unit:
+                log.info("leaving job %s running for the next daemon", rp.job_id)
+                if rp.log_file is not None:
+                    rp.log_file.close()
+                continue
             await self.executor.stop(rp)
         self.store.close()
 
@@ -394,8 +443,9 @@ class Engine:
         except asyncio.CancelledError:  # pragma: no cover
             raise
         finally:
-            with contextlib.suppress(Exception):
-                rp.log_file.close()
+            if rp.log_file is not None:
+                with contextlib.suppress(Exception):
+                    rp.log_file.close()
 
         now = time.time()
         # Keep the job's slots until its whole process tree is gone, not just the main

@@ -18,6 +18,9 @@ class FakeProc:
         self.pid = pid
         self.returncode: int | None = None
 
+    def poll(self) -> bool:
+        return self.returncode is not None
+
 
 def _rp(unit: str | None) -> RunningProcess:
     return RunningProcess(job_id=7, proc=FakeProc(), unit=unit, log_path=Path("/dev/null"), log_file=None)  # type: ignore[arg-type]

@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import subprocess
 import time
 from pathlib import Path
 
@@ -10,7 +11,7 @@ import pytest
 from ajs.config import Config
 from ajs.db import Store
 from ajs.engine import Engine
-from ajs.executor import Executor
+from ajs.executor import Executor, JobProcess, RunningProcess
 from ajs.models import JobState
 
 
@@ -251,6 +252,47 @@ class TestRecovery:
         assert recovered.state is JobState.FAILED
         assert "daemon restarted" in (recovered.cancel_reason or "")
         assert engine.status()["used"]["cpu"] == 0
+
+    async def test_job_that_ended_while_the_daemon_was_down_keeps_its_exit_code(self, engine):
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")
+        engine.store.update_job(job.id, state=str(JobState.RUNNING), started_at=0.0, pid=999999)
+        engine.executor.exit_file(job.id).write_text("3\n")
+
+        await engine.recover()
+
+        recovered = engine.store.get_job(job.id)
+        assert recovered.state is JobState.FAILED
+        assert recovered.exit_code == 3
+        assert not recovered.cancel_reason
+
+    async def test_live_job_is_adopted_and_supervised_to_the_end(self, engine, monkeypatch, tmp_path):
+        """A restart must not cost a running job: the new daemon watches it to the end."""
+        job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")
+        exit_file = engine.executor.exit_file(job.id)
+        proc = subprocess.Popen(["/bin/sh", "-c", f"sleep 0.3; echo 0 > {exit_file}"])
+        engine.store.update_job(job.id, state=str(JobState.RUNNING), started_at=0.0, pid=proc.pid, unit="u.scope")
+
+        def adopt(j):
+            return RunningProcess(
+                job_id=j.id,
+                proc=JobProcess(j.pid, exit_file=exit_file),
+                unit=j.unit,
+                log_path=tmp_path / "log",
+                log_file=None,
+            )
+
+        monkeypatch.setattr(engine.executor, "adopt", adopt)
+        await engine.recover()
+        assert engine.store.get_job(job.id).state is JobState.RUNNING
+        assert job.id in engine.running
+
+        async with asyncio.timeout(5):
+            await engine.wait(job.id, 5)
+        proc.wait()
+        done = engine.store.get_job(job.id)
+        assert done.state is JobState.DONE
+        assert done.exit_code == 0
+        assert [e["action"] for e in engine.store.events(job_id=job.id)] == ["adopt"]
 
 
 class TestPauseAndDrain:

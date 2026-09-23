@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import ctypes
 import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,9 +33,114 @@ log = logging.getLogger("ajs.executor")
 #: than a short delay (see ``_await_cgroup``).
 CGROUP_SETTLE_TIMEOUT_S = 3.0
 
+#: How often to check on a job when the kernel cannot tell us it exited (no pidfd).
+EXIT_POLL_S = 0.2
+
+#: Runs the job and records its exit status in a file, so a daemon restarted while the job
+#: ran can still say how it ended: the job is no longer its child, so it cannot wait on it.
+EXIT_WRAPPER = 'rc=0; "$@" || rc=$?; printf "%s\\n" "$rc" > "$AJS_EXIT_FILE"; exit "$rc"'
+
 #: How long a job's leftover processes get to exit after its main process has, first on
 #: their own and then after SIGTERM, before they are SIGKILLed.
 DRAIN_GRACE_S = 10.0
+
+
+class JobProcess:
+    """The main process of a job, whether this daemon started it or inherited it.
+
+    Deliberately not an asyncio subprocess: asyncio kills a child that is still running
+    when its transport closes, which is every job the moment the daemon exits. A plain
+    Popen is left alone, so jobs in their own systemd scopes outlive a restart and the
+    next daemon adopts them.
+    """
+
+    def __init__(self, pid: int, *, popen: subprocess.Popen[bytes] | None = None, exit_file: Path | None = None):
+        self.pid = pid
+        self.returncode: int | None = None
+        self._popen = popen
+        self._exit_file = exit_file
+        self._done: asyncio.Future[int | None] | None = None
+
+    @property
+    def adopted(self) -> bool:
+        return self._popen is None
+
+    def poll(self) -> bool:
+        """True once the process has gone; sets ``returncode`` where it can be known."""
+        if self._popen is not None:
+            code = self._popen.poll()
+            if code is None:
+                return False
+            self.returncode = code
+            return True
+        if _alive(self.pid):
+            return False
+        self.returncode = read_exit_file(self._exit_file) if self._exit_file else None
+        return True
+
+    async def wait(self) -> int | None:
+        """Wait for the process to exit. For an adopted job the code comes from its exit
+        file, and is None if it died without writing one (killed by a signal)."""
+        if self._done is None:
+            self._done = asyncio.ensure_future(self._wait())
+        return await asyncio.shield(self._done)
+
+    async def _wait(self) -> int | None:
+        loop = asyncio.get_running_loop()
+        fd = _pidfd_open(self.pid)
+        if fd is None:
+            while not self.poll():
+                await asyncio.sleep(EXIT_POLL_S)
+            return self.returncode
+        exited = loop.create_future()
+        loop.add_reader(fd, lambda: exited.done() or exited.set_result(None))
+        try:
+            if not self.poll():
+                await exited
+            # The pidfd turns readable at exit; a child may need a moment to be reapable.
+            while not self.poll():
+                await asyncio.sleep(0.01)
+        finally:
+            loop.remove_reader(fd)
+            os.close(fd)
+        return self.returncode
+
+
+def _pidfd_open(pid: int) -> int | None:
+    """A file descriptor that turns readable when ``pid`` exits, or None if unsupported.
+
+    ``os.pidfd_open`` is missing from some Python builds even on kernels that have the
+    syscall, so fall back to calling it directly (434 on every Linux architecture)."""
+    opener = getattr(os, "pidfd_open", None)
+    if opener is not None:
+        try:
+            return opener(pid)
+        except OSError:
+            return None
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        fd = libc.syscall(434, ctypes.c_int(pid), ctypes.c_uint(0))
+    except (OSError, AttributeError):
+        return None
+    return fd if fd >= 0 else None
+
+
+def _alive(pid: int) -> bool:
+    """True while ``pid`` runs. A zombie has exited; it only waits for its parent."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[-1].split()[0] != "Z"
+
+
+def read_exit_file(path: Path) -> int | None:
+    try:
+        return int(path.read_text().strip())
+    except (OSError, ValueError):
+        return None
 
 
 @dataclass(slots=True)
@@ -41,10 +148,10 @@ class RunningProcess:
     """Handle on a live job."""
 
     job_id: int
-    proc: asyncio.subprocess.Process
+    proc: JobProcess
     unit: str | None
     log_path: Path
-    log_file: IO[bytes]
+    log_file: IO[bytes] | None
     cgroup: Path | None = None
     """The cgroup the job actually runs in, resolved once systemd has moved it there.
     None means unknown, and callers must treat unknown as "cannot account for this job"
@@ -94,8 +201,11 @@ class Executor:
                 "-p",
                 "MemorySwapMax=0",
             ]
-        argv += list(job.cmd)
+        argv += ["/bin/sh", "-c", EXIT_WRAPPER, "ajs-job", *job.cmd]
         return argv, f"{unit}.scope"
+
+    def exit_file(self, job_id: int) -> Path:
+        return self.log_dir / f"job-{job_id}.exit"
 
     async def start(self, job: Job, need: dict[str, int]) -> RunningProcess:
         """Launch ``job``. Raises OSError if the command cannot be spawned."""
@@ -112,6 +222,8 @@ class Executor:
         env["AJS_GPU_MEM_MB"] = str(need.get("gpu_mem_mb", 0))
         env["AJS_EXCLUSIVE"] = "1" if job.resources.exclusive else "0"
         env["AJS_GPU_EXCLUSIVE"] = "1" if job.resources.gpu_exclusive else "0"
+        env["AJS_EXIT_FILE"] = str(self.exit_file(job.id))
+        self.exit_file(job.id).unlink(missing_ok=True)
         if not (job.resources.gpu or job.resources.gpu_exclusive):
             # A job that did not ask for the GPU must not be able to take it by accident;
             # the scheduler's VRAM arithmetic is only true if this holds.
@@ -120,22 +232,39 @@ class Executor:
         cwd = job.cwd if Path(job.cwd).is_dir() else str(Path.home())
 
         try:
-            proc = await asyncio.create_subprocess_exec(
-                *argv,
+            popen = subprocess.Popen(
+                argv,
                 cwd=cwd,
                 env=env,
                 stdout=log_file,
-                stderr=asyncio.subprocess.STDOUT,
-                stdin=asyncio.subprocess.DEVNULL,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
                 start_new_session=True,
             )
         except OSError:
             log_file.close()
             raise
 
+        proc = JobProcess(popen.pid, popen=popen)
         rp = RunningProcess(job_id=job.id, proc=proc, unit=unit, log_path=log_path, log_file=log_file)
         rp.cgroup = await self._await_cgroup(rp)
         return rp
+
+    def adopt(self, job: Job) -> RunningProcess | None:
+        """Take over a job a previous daemon started, if it is still running.
+
+        Only a job in its own scope can have survived: without systemd it lived in the
+        daemon's cgroup and went down with it. The PID must still sit in the job's scope,
+        which also rules out the PID having been reused by something else.
+        """
+        if not self._systemd or not job.unit or not job.pid:
+            return None
+        cgroup = cgroup_path_for_pid(job.pid)
+        if cgroup is None or cgroup.name != job.unit:
+            return None
+        proc = JobProcess(job.pid, exit_file=self.exit_file(job.id))
+        log_path = Path(job.log_path) if job.log_path else self.log_dir / f"job-{job.id}.log"
+        return RunningProcess(job_id=job.id, proc=proc, unit=job.unit, log_path=log_path, log_file=None, cgroup=cgroup)
 
     @staticmethod
     async def _await_cgroup(rp: RunningProcess) -> Path | None:
@@ -156,7 +285,7 @@ class Executor:
             path = cgroup_path_for_pid(rp.proc.pid)
             if path is not None and path.name == rp.unit:
                 return path
-            if rp.proc.returncode is not None or time.monotonic() >= deadline:
+            if rp.proc.poll() or time.monotonic() >= deadline:
                 # Exited before the move completed, or systemd never delivered. Better
                 # to report "unknown" than to measure the wrong cgroup as if it were ours.
                 if rp.proc.returncode is None:
