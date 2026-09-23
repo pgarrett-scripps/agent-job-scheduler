@@ -60,6 +60,10 @@ class Decision:
     reservation: Reservation | None = None
     blocked: dict[int, str] = field(default_factory=dict)
     """job id -> why it did not start, surfaced verbatim to agents via `ajs status`."""
+    settling: list[int] = field(default_factory=list)
+    """Exclusive jobs holding the machine while it goes quiet."""
+    unquiet_start: dict[int, str] = field(default_factory=dict)
+    """Exclusive jobs started after ``quiet_max_wait_s`` without a quiet window, and why."""
 
 
 def effective_request(job: Job, cap: Capacity) -> dict[str, int]:
@@ -179,6 +183,9 @@ def plan(
     external_usage: dict[str, int] | None = None,
     free_disk_mb: int = 1 << 30,
     last_finish_at: float = 0.0,
+    quiet_since: float | None = 0.0,
+    noise: str = "",
+    settling_since: dict[int, float] | None = None,
 ) -> Decision:
     """Decide which queued jobs may start right now.
 
@@ -189,6 +196,10 @@ def plan(
     ``external_usage`` is resource consumed by processes ajs did not start. It is
     subtracted from what is free but *not* from ``cap``, so a busy machine delays jobs
     instead of declaring them impossible.
+
+    ``quiet_since`` is when load outside ajs last dropped below the quiet limits, or None
+    while it is still above them; ``noise`` says what is over. ``settling_since`` is when
+    each exclusive job began holding the machine, to cap how long it waits for quiet.
     """
     decision = Decision()
 
@@ -309,12 +320,27 @@ def plan(
                 continue
 
         if job.resources.exclusive:
-            quiet_for = now - last_finish_at if last_finish_at else float("inf")
-            if quiet_for < cfg.settle_seconds:
-                remaining = cfg.settle_seconds - quiet_for
-                decision.blocked[job.id] = (
-                    f"settling: {remaining:.0f}s left before the machine is quiet enough to time on"
-                )
+            since_finish = now - last_finish_at if last_finish_at else float("inf")
+            since_quiet = now - quiet_since if quiet_since is not None else 0.0
+            waited = now - (settling_since or {}).get(job.id, now)
+            reason = ""
+            if since_finish < cfg.settle_seconds:
+                left = cfg.settle_seconds - since_finish
+                reason = f"settling: {left:.0f}s left before the machine is quiet enough to time on"
+            elif since_quiet < cfg.quiet_seconds:
+                if waited >= cfg.quiet_max_wait_s:
+                    decision.unquiet_start[job.id] = (
+                        f"started after waiting {waited / 60:.0f} min without a quiet window"
+                        + (f" ({noise})" if noise else "")
+                    )
+                elif quiet_since is None:
+                    reason = f"settling: waiting for the machine to go quiet ({noise or 'load outside ajs'})"
+                else:
+                    reason = f"settling: quiet for {since_quiet:.0f}s of the {cfg.quiet_seconds:.0f}s needed"
+            if reason:
+                remaining = max(cfg.settle_seconds - since_finish, cfg.quiet_seconds - since_quiet, 1.0)
+                decision.blocked[job.id] = reason
+                decision.settling.append(job.id)
                 # Hold the resources rather than letting something else grab them, or we
                 # would never get through the settle period.
                 _deduct(free, need)

@@ -298,3 +298,43 @@ class TestCountedSemaphores:
         jobs = [make_job(1, locks=["scratch"]), make_job(2, locks=["scratch"], submitted_at=NOW + 1)]
         decision = run_plan(jobs, cap=cap, cfg=cfg)
         assert decision.start == [1]
+
+
+class TestQuietGate:
+    """An exclusive job waits for load outside ajs to drop, holding the machine meanwhile."""
+
+    def test_waits_while_the_machine_is_noisy(self, cap, cfg):
+        decision = run_plan([make_job(1, exclusive=True)], cap=cap, cfg=cfg, quiet_since=None, noise="iowait 11%")
+        assert decision.start == []
+        assert "iowait 11%" in decision.blocked[1]
+        assert decision.settling == [1]
+
+    def test_waits_for_the_full_quiet_window(self, cap, cfg):
+        decision = run_plan([make_job(1, exclusive=True)], cap=cap, cfg=cfg, quiet_since=NOW - 20)
+        assert decision.start == []
+        assert "quiet for 20s" in decision.blocked[1]
+
+    def test_starts_once_quiet_long_enough(self, cap, cfg):
+        decision = run_plan([make_job(1, exclusive=True)], cap=cap, cfg=cfg, quiet_since=NOW - 61)
+        assert decision.start == [1]
+
+    def test_waiting_job_blocks_other_jobs(self, cap, cfg):
+        jobs = [make_job(1, exclusive=True, submitted_at=NOW), make_job(2, cpu=2, submitted_at=NOW + 1)]
+        decision = run_plan(jobs, cap=cap, cfg=cfg, quiet_since=None, noise="x")
+        assert decision.start == []
+
+    def test_starts_anyway_after_the_max_wait(self, cap, cfg):
+        decision = run_plan(
+            [make_job(1, exclusive=True)],
+            cap=cap,
+            cfg=cfg,
+            quiet_since=None,
+            noise="iowait 11%",
+            settling_since={1: NOW - cfg.quiet_max_wait_s},
+        )
+        assert decision.start == [1]
+        assert "without a quiet window" in decision.unquiet_start[1]
+
+    def test_non_exclusive_jobs_ignore_the_gate(self, cap, cfg):
+        decision = run_plan([make_job(1, cpu=2)], cap=cap, cfg=cfg, quiet_since=None, noise="x")
+        assert decision.start == [1]

@@ -501,6 +501,8 @@ def job_cmd(
             console.print(f"  {label}: {', '.join(map(str, job[key]))}")
     if job.get("blocked_reason"):
         console.print(f"  waiting: {job['blocked_reason']}")
+    for line in job.get("interference") or []:
+        console.print(f"[yellow]  disturbed:[/yellow] {line}")
     if job.get("cancel_reason"):
         console.print(f"  ended:   {job['cancel_reason']}")
 

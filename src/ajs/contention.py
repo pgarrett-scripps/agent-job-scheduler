@@ -44,6 +44,27 @@ def system_busy_seconds() -> float | None:
     return (user + nice + system + irq) / hz
 
 
+def system_cpu_ticks() -> tuple[float, float] | None:
+    """(iowait ticks, total ticks) across all cores since boot.
+
+    Kept apart from `system_busy_seconds` because iowait is the one thing that function
+    deliberately ignores: a job blocked on disk does not take cores, but it does slow
+    every other job's disk access, which is enough to spoil a timing run.
+    """
+    try:
+        with open("/proc/stat") as fh:
+            line = fh.readline()
+    except OSError:  # pragma: no cover - non-Linux
+        return None
+    if not line.startswith("cpu "):  # pragma: no cover
+        return None
+    fields = [float(x) for x in line.split()[1:]]
+    if len(fields) < 5:  # pragma: no cover
+        return None
+    # guest time is already counted inside user, so stop before it.
+    return fields[4], sum(fields[:8])
+
+
 def cgroup_path_for_pid(pid: int) -> Path | None:
     """Resolve a PID's cgroup v2 directory.
 
@@ -252,9 +273,13 @@ class ExternalLoad:
         self.ready = False
         """False until two samples exist. Until then callers should fall back to a
         conservative prior rather than trusting a 0."""
+        self.iowait_pct: float = 0.0
+        """Share of all CPU time spent waiting on disk, smoothed like ``cpu_cores``.
+        Not attributable to anyone: the kernel does not say whose I/O it was."""
         self._busy: float | None = None
         self._own_cpu: float = 0.0
         self._t: float | None = None
+        self._ticks: tuple[float, float] | None = None
 
     def sample(
         self,
@@ -273,6 +298,8 @@ class ExternalLoad:
         available = sysinfo.available_mem_mb()
         if available is not None:
             self.mem_mb = max(0, (total - available) - own_mem_mb)
+
+        self._sample_iowait(now)
 
         busy = system_busy_seconds()
         if busy is None:  # pragma: no cover - non-Linux
@@ -297,6 +324,21 @@ class ExternalLoad:
 
         self._busy, self._own_cpu, self._t = busy, own_cpu_seconds, now
         self.ready = True
+
+    def _sample_iowait(self, now: float) -> None:
+        ticks = system_cpu_ticks()
+        if ticks is None:  # pragma: no cover - non-Linux
+            return
+        previous, self._ticks = self._ticks, ticks
+        if previous is None or self._t is None:
+            return
+        total = ticks[1] - previous[1]
+        if total <= 0:
+            return
+        pct = 100.0 * max(0.0, ticks[0] - previous[0]) / total
+        dt = max(now - self._t, 1e-3)
+        alpha = 1.0 - 0.5 ** (dt / self.half_life) if self.half_life > 0 else 1.0
+        self.iowait_pct = pct if not self.ready else self.iowait_pct + alpha * (pct - self.iowait_pct)
 
     def _sample_gpu(self, own_cgroups: set[Path]) -> None:
         apps = sysinfo.gpu_compute_apps()
@@ -344,3 +386,74 @@ class ExternalLoad:
             # fully taken.
             "gpu_mem_mb": self.gpu_mem_mb,
         }
+
+
+@dataclass(slots=True)
+class ForeignProcess:
+    pid: int
+    name: str
+    cwd: str
+    cores: float
+
+    def describe(self) -> str:
+        where = f" in {self.cwd}" if self.cwd else ""
+        return f"pid {self.pid} {self.name}{where} at {self.cores:.1f} cores"
+
+
+class ForeignProcesses:
+    """Names the processes outside ajs that are using CPU.
+
+    `ExternalLoad` says *how much* foreign work there is; this says *whose*, so an
+    interference note can point at a PID and a repository instead of a number. It walks
+    /proc, so it is only run while a timing job needs the answer.
+    """
+
+    def __init__(self) -> None:
+        self._last: dict[int, float] = {}
+        self._t: float | None = None
+
+    @property
+    def sampled_at(self) -> float | None:
+        return self._t
+
+    def sample(
+        self, now: float, own_cgroups: set[Path], *, top: int = 3, min_cores: float = 0.5
+    ) -> list[ForeignProcess]:
+        """CPU use per foreign process since the previous call, busiest first."""
+        current: dict[int, float] = {}
+        names: dict[int, str] = {}
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            try:
+                raw = (entry / "stat").read_text()
+            except OSError:
+                continue
+            # The command name is in parentheses and may itself contain spaces.
+            name = raw[raw.find("(") + 1 : raw.rfind(")")]
+            fields = raw[raw.rfind(")") + 2 :].split()
+            if len(fields) < 13:
+                continue
+            current[pid] = (int(fields[11]) + int(fields[12])) / 100.0
+            names[pid] = name
+        previous, last_t = self._last, self._t
+        self._last, self._t = current, now
+        if last_t is None or now <= last_t:
+            return []
+        dt = now - last_t
+        busy = []
+        for pid, cpu in current.items():
+            cores = (cpu - previous.get(pid, cpu)) / dt
+            if cores < min_cores:
+                continue
+            cgroup = cgroup_path_for_pid(pid)
+            if cgroup is not None and cgroup in own_cgroups:
+                continue
+            try:
+                cwd = str(Path(f"/proc/{pid}/cwd").readlink())
+            except OSError:
+                cwd = ""
+            busy.append(ForeignProcess(pid, names[pid], cwd.replace(str(Path.home()), "~"), cores))
+        busy.sort(key=lambda p: p.cores, reverse=True)
+        return busy[:top]

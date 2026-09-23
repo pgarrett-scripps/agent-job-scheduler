@@ -51,6 +51,10 @@ If you are measuring how long something takes, you MUST pass exclusive=true. Tha
 the scheduler take the whole machine, wait for it to go quiet, run your job alone, and
 report whether anything else interfered. A timing run without it is unreliable and the
 number should not be trusted. This is the one case where waiting is correct.
+"Quiet" is ajs's job, not your script's: it waits until CPU and iowait outside ajs have
+stayed low for a minute before starting, and your max_runtime does not run meanwhile. Do
+not add your own busy-wait. While the job runs, ajs names any process that disturbs it
+(`interference` in job_status); afterwards `contended` says whether to rerun that chunk.
 
 For GPU work, pass gpu=1 and declare `gpu_mem`. The card has 4 GB total, so a job that
 does not say how much VRAM it needs is charged for the whole thing and will serialise

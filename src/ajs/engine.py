@@ -17,7 +17,7 @@ from typing import Any
 
 from . import sysinfo
 from .config import Config, db_path, log_dir
-from .contention import ContentionMonitor, ExternalLoad
+from .contention import ContentionMonitor, ExternalLoad, ForeignProcesses
 from .db import Store
 from .executor import Executor, RunningProcess
 from .models import Job, JobClass, JobState, ResourceRequest, short_actor
@@ -39,6 +39,19 @@ class Engine:
         self.last_decision = Decision()
         self.last_finish_at: float = 0.0
         self.external = ExternalLoad(half_life_s=cfg.external_load_half_life_s)
+        self.foreign = ForeignProcesses()
+        self.quiet_since: float | None = None
+        """When load outside ajs last fell within the quiet limits; None while it is over."""
+        self.noise = ""
+        """What is over the quiet limits right now, for blocked reasons and job notes."""
+        self.settling_since: dict[int, float] = {}
+        """Exclusive jobs holding the machine while it goes quiet, and since when."""
+        self.interference: dict[int, list[str]] = {}
+        """Timing jobs -> interference seen while they ran, one line per episode."""
+        self._interfering: set[int] = set()
+        self._timing: set[int] = set()
+        """Running exclusive (CPU) jobs; a GPU-exclusive run is not spoiled by CPU load."""
+        self._own_cgroups: set[Path] = set()
         self.paused = False
         self.pause_until: float | None = None
         self.dep_waiting: dict[int, str] = {}
@@ -140,8 +153,15 @@ class Engine:
             external_usage=self._external_usage(),
             free_disk_mb=sysinfo.free_disk_mb(self.cfg.disk_watch_path),
             last_finish_at=self.last_finish_at,
+            quiet_since=self.quiet_since if self.cfg.track_external_load else 0.0,
+            noise=self.noise,
+            settling_since=self.settling_since,
         )
         self.last_decision = decision
+        self.settling_since = {j: self.settling_since.get(j, now) for j in decision.settling}
+        for job_id, why in decision.unquiet_start.items():
+            self.interference.setdefault(job_id, []).append(why)
+            self.store.add_event(job_id, actor="ajs", action="unquiet-start", detail=why)
 
         for job_id in decision.start:
             job = self.store.get_job(job_id)
@@ -176,8 +196,57 @@ class Engine:
                 own_cpu += cpu
             if mem is not None:
                 own_mem += mem // (1024 * 1024)
+        self._own_cgroups = own_cgroups
         if self.cfg.track_external_load:
             self.external.sample(now, own_cpu, own_mem, own_cgroups)
+            self._update_quiet(now)
+
+    def _update_quiet(self, now: float) -> None:
+        """Track whether the machine is quiet enough to time on, and flag timing runs
+        that something outside ajs is disturbing.
+
+        This is the one place that decides "quiet", so benchmark scripts do not each need
+        their own busy-wait: an exclusive job does not start until the machine has been
+        quiet for ``quiet_seconds``, and its max_runtime does not run while it waits.
+        """
+        if not self.external.ready:
+            return
+        cores = max(0.0, self.external.cpu_cores - self.cfg.external_cpu_allowance)
+        loud_cpu = cores > self.cfg.quiet_cpu_cores
+        # Once a timing job runs, its own I/O shows up as iowait, so only the CPU part
+        # can be held against the machine. Before the start, iowait is someone else's.
+        timing = [j for j in self.running if self._is_timing(j)]
+        loud_io = not timing and self.external.iowait_pct > self.cfg.quiet_iowait_pct
+        parts = []
+        if loud_cpu:
+            parts.append(f"{cores:.1f} cores outside ajs above the desktop allowance")
+        if loud_io:
+            parts.append(f"iowait {self.external.iowait_pct:.0f}%")
+        self.noise = ", ".join(parts)
+        if parts:
+            self.quiet_since = None
+        elif self.quiet_since is None:
+            self.quiet_since = now
+
+        for job_id in timing:
+            if loud_cpu and job_id not in self._interfering:
+                self._interfering.add(job_id)
+                who = self.foreign.sample(now, self._own_cgroups)
+                # The first /proc walk only sets a baseline; name the culprits on the next.
+                line = time.strftime("%H:%M:%S", time.localtime(now)) + f" {self.noise}"
+                if who:
+                    line += ": " + "; ".join(p.describe() for p in who)
+                self.interference.setdefault(job_id, []).append(line)
+                self.store.add_event(job_id, actor="ajs", action="interference", detail=line)
+                log.warning("timing job %s disturbed: %s", job_id, line)
+            elif not loud_cpu:
+                self._interfering.discard(job_id)
+        if timing and now - (self.foreign.sampled_at or 0.0) >= 5.0:
+            # Keep a fresh /proc baseline so the next episode can name its culprits.
+            self.foreign.sample(now, self._own_cgroups)
+
+    def _is_timing(self, job_id: int) -> bool:
+        return job_id in self._timing
 
     def _external_usage(self) -> dict[str, int] | None:
         if not self.cfg.track_external_load:
@@ -290,6 +359,8 @@ class Engine:
         )
         monitor.start(rp.proc.pid, now, cgroup=rp.cgroup)
         self.monitors[job.id] = monitor
+        if job.resources.exclusive:
+            self._timing.add(job.id)
         self.running[job.id] = rp
 
         self.store.update_job(
@@ -348,8 +419,17 @@ class Engine:
             report = monitor.finish(now)
             fields["contended"] = 1 if report.contended else 0
             fields["contention_note"] = report.note
-            if report.contended and job is not None and (job.resources.exclusive or job.resources.gpu_exclusive):
-                log.warning("job %s ran CONTENDED: %s", job_id, report.note)
+            seen = self.interference.get(job_id)
+            if seen:
+                # Any episode spoils a reported timing, even if the run-long average
+                # stays under the threshold; the owner decides what to redo.
+                fields["contended"] = 1
+                fields["contention_note"] = f"{report.note}; interference: {' | '.join(seen)}"
+            if fields["contended"] and job is not None and (job.resources.exclusive or job.resources.gpu_exclusive):
+                log.warning("job %s ran CONTENDED: %s", job_id, fields["contention_note"])
+        self.interference.pop(job_id, None)
+        self._interfering.discard(job_id)
+        self._timing.discard(job_id)
 
         if job is not None and job.cancel_reason and "max_runtime" in job.cancel_reason:
             fields["state"] = str(JobState.TIMEOUT)
@@ -583,6 +663,7 @@ class Engine:
         monitor = self.monitors.get(job.id)
         data["cpu_now"] = None if monitor is None else monitor.cpu_cores_now
         data["mem_now_mb"] = None if monitor is None else monitor.mem_now_mb
+        data["interference"] = list(self.interference.get(job.id, []))
         return data
 
     # --- leases -----------------------------------------------------------

@@ -292,3 +292,30 @@ def test_foreign_vram_is_charged_even_to_a_gpu_timing_run(cfg, cap):
         external_usage={"cpu": 19, "mem_mb": 40000, "gpu": 0, "gpu_mem_mb": 3000},
     )
     assert both.start == []  # exempt from the desktop's cpu/mem, still blocked by VRAM
+
+
+def test_iowait_share_is_measured(fake_machine, monkeypatch):
+    ticks = {"v": (0.0, 0.0)}
+    monkeypatch.setattr(contention, "system_cpu_ticks", lambda: ticks["v"])
+    ext = ExternalLoad(half_life_s=0.0)
+    ext.sample(now=0.0, own_cpu_seconds=0.0, own_mem_mb=0)
+    ticks["v"] = (100.0, 1000.0)
+    fake_machine["busy"] = 1.0
+    ext.sample(now=10.0, own_cpu_seconds=0.0, own_mem_mb=0)
+    assert ext.iowait_pct == pytest.approx(10.0)
+
+
+def test_foreign_processes_name_a_busy_process():
+    """A real /proc walk: this test's own busy loop must show up by PID."""
+    import os
+    import time as _time
+
+    from ajs.contention import ForeignProcesses
+
+    fp = ForeignProcesses()
+    fp.sample(_time.time(), set(), min_cores=0.0)
+    end = _time.time() + 0.3
+    while _time.time() < end:
+        pass
+    busy = fp.sample(_time.time(), set(), top=50, min_cores=0.3)
+    assert os.getpid() in {p.pid for p in busy}

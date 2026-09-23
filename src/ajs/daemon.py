@@ -104,6 +104,7 @@ class Server:
             raise KeyError(f"no such job: {job_id}")
         data = job.to_dict()
         data["blocked_reason"] = self.engine.blocked_reason(job.id)
+        data["interference"] = list(self.engine.interference.get(job.id, []))
         return data
 
     def do_jobs(
@@ -121,6 +122,7 @@ class Server:
             raise KeyError(f"no such job: {job_id}")
         data = job.to_dict()
         data["blocked_reason"] = self.engine.blocked_reason(job.id)
+        data["interference"] = list(self.engine.interference.get(job.id, []))
         data["timed_out"] = not job.state.is_terminal
         return data
 

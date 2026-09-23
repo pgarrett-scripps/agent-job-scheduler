@@ -121,6 +121,24 @@ class Config:
     """Quiet period between the last job exiting and an exclusive job starting, so page
     cache writeback and dying processes stop perturbing the measurement."""
 
+    quiet_seconds: float = 60.0
+    """How long the machine must stay quiet before an exclusive job starts. Quiet means
+    foreign CPU at most ``quiet_cpu_cores`` above the desktop allowance and iowait at
+    most ``quiet_iowait_pct``. The job's max_runtime does not run while it waits, which is
+    why this lives here and not in each benchmark script."""
+
+    quiet_cpu_cores: float = 1.0
+    """Foreign cores above ``external_cpu_allowance`` that count as noise, both for the
+    quiet gate and for flagging interference while a timing run is going."""
+
+    quiet_iowait_pct: float = 5.0
+    """Share of CPU time spent waiting on disk above which the machine is not quiet.
+    Only checked before the start: once the job runs, its own I/O shows up here too."""
+
+    quiet_max_wait_s: float = 1800.0
+    """Give up waiting for quiet after this long and start anyway, noting it on the job.
+    Without a cap, a permanently busy desktop would wedge the queue behind one job."""
+
     contention_threshold: float = 4.0
     """Foreign CPU cores (work not attributable to the job's own cgroup) above which an
     exclusive run is stamped `contended`.
