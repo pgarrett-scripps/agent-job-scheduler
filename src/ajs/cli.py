@@ -7,6 +7,7 @@ anything that can run a command can use the scheduler through this.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -759,6 +760,108 @@ def ps_cmd(
             display_name(job),
         )
     console.print(table)
+
+
+INBOX_FIRST_LOOK_S = 3600
+"""How far back a session's first inbox check looks, so it is not flooded with history."""
+
+
+def _inbox_cursor_path(session_id: str) -> Path:
+    safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in session_id)
+    return state_dir() / "inbox" / f"{safe}.json"
+
+
+def inbox_lines(box: dict[str, Any], *, already_stalled: set[int] | None = None) -> list[str]:
+    """One plain line per thing the session's agent should know about its own jobs."""
+    lines = []
+    for job in box.get("finished", []):
+        line = f"job {job['id']} {display_name(job)}: {job['state']}"
+        if job.get("exit_code") not in (None, 0):
+            line += f" (exit {job['exit_code']})"
+        if job.get("cancel_reason"):
+            line += f" - {job['cancel_reason']}"
+        if job.get("contended"):
+            line += f" - CONTENDED, timing not trustworthy: {job.get('contention_note') or ''}".rstrip(": ")
+        if job["state"] != "done" and job.get("log_path"):
+            line += f" - log {job['log_path']}"
+        lines.append(line)
+    for ev in box.get("events", []):
+        line = f"job {ev['job_id']}: {ev['action']} by {short_actor(str(ev.get('actor') or 'ajs'))}"
+        if ev.get("detail"):
+            line += f" ({ev['detail']})"
+        if ev.get("reason"):
+            line += f": {ev['reason']}"
+        lines.append(line)
+    for job in box.get("stalled", []):
+        if already_stalled is not None and job["id"] in already_stalled:
+            continue
+        minutes = job["log_quiet_s"] / 60
+        lines.append(
+            f"job {job['id']} {display_name(job)}: running but its log has been silent for "
+            f"{minutes:.0f} min - check it is not stuck ({job.get('log_path')})"
+        )
+    return lines
+
+
+@app.command()
+def inbox(
+    session: Annotated[str, typer.Option("--session", help="Whose jobs. Default: this session.")] = "",
+    since: Annotated[
+        str, typer.Option("--since", help="Look back this far (e.g. 2h) instead of from the last check.")
+    ] = "",
+    hook: Annotated[
+        bool, typer.Option("--hook", help="Claude Code hook mode: session from stdin JSON, plain text, never fails.")
+    ] = False,
+    json_out: Annotated[bool, typer.Option("--json")] = False,
+) -> None:
+    """What happened to this session's jobs since it last looked: finished, failed,
+    held or cancelled by someone else, disturbed, or silent for 15 min while running."""
+    if hook:
+        try:
+            payload = json.loads(sys.stdin.read() or "{}")
+        except ValueError:
+            payload = {}
+        if payload.get("session_id"):
+            session = f"claude:{payload['session_id']}"
+    session = session or session_identity()
+    cursor_path = _inbox_cursor_path(session)
+    cursor: dict[str, Any] = {}
+    if not since:
+        try:
+            cursor = json.loads(cursor_path.read_text())
+        except (OSError, ValueError):
+            cursor = {}
+    if since:
+        start = time.time() - parse_duration(since)
+    else:
+        start = float(cursor.get("since") or time.time() - INBOX_FIRST_LOOK_S)
+    try:
+        box = _client().inbox(session, start)
+    except (protocol.SchedulerError, OSError) as exc:
+        if hook:
+            return  # a missing daemon must never break the agent's prompt
+        _fail(str(exc))
+        return
+    reported = set(cursor.get("stalled") or [])
+    lines = inbox_lines(box, already_stalled=reported)
+    if not since:
+        with contextlib.suppress(OSError):
+            cursor_path.parent.mkdir(parents=True, exist_ok=True)
+            still = sorted({j["id"] for j in box.get("stalled", [])})
+            cursor_path.write_text(json.dumps({"since": box["now"], "stalled": still}))
+    if json_out:
+        console.print_json(data=box)
+        return
+    if hook:
+        if lines:
+            print("ajs - your jobs since your last message:")
+            print("\n".join(f"- {line}" for line in lines))
+        return
+    if not lines:
+        console.print("[dim]nothing new on this session's jobs[/dim]")
+        return
+    for line in lines:
+        console.print(line, markup=False, highlight=False)
 
 
 @app.command()

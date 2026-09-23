@@ -147,6 +147,9 @@ class Server:
     def do_events(self, job_id: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
         return self.engine.store.events(job_id=None if job_id is None else int(job_id), limit=int(limit))
 
+    def do_inbox(self, session_id: str, since: float, stall_s: float = 900.0) -> dict[str, Any]:
+        return self.engine.inbox(session_id, float(since), float(stall_s))
+
     def do_logs(self, job_id: int, lines: int = 50) -> str:
         return self.engine.log_tail(int(job_id), int(lines))
 

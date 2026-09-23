@@ -722,6 +722,32 @@ class Engine:
             "measured": self._measured(running),
         }
 
+    def inbox(self, session_id: str, since: float, stall_s: float = 900.0) -> dict[str, Any]:
+        """What changed on one session's jobs since ``since``, for that session's agent.
+
+        Finished jobs, anything done to its jobs by someone else (holds, cancels, priority
+        changes, interference, adoption after a restart), and running jobs whose log has
+        been silent for ``stall_s``. The caller keeps the cursor: pass back ``now``.
+        """
+        now = time.time()
+        finished, stalled = [], []
+        for job in self.store.session_jobs(session_id, since=since):
+            if job.state.is_terminal:
+                finished.append(job.to_dict())
+            elif job.state is JobState.RUNNING and job.log_path:
+                try:
+                    quiet = now - Path(job.log_path).stat().st_mtime
+                except OSError:
+                    continue
+                if quiet >= stall_s:
+                    stalled.append({**job.to_dict(), "log_quiet_s": quiet})
+        return {
+            "now": now,
+            "finished": finished,
+            "events": self.store.session_events(session_id, since=since),
+            "stalled": stalled,
+        }
+
     def _mem_headroom(self, running: list[Job]) -> int | None:
         """Memory a new job can really have: MemAvailable, less what running jobs may
         still grow into up to their declared limits, less the guard. A job whose usage

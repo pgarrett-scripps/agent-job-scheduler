@@ -220,6 +220,23 @@ class Store:
         rows = self.conn.execute(f"SELECT * FROM job_events {where} ORDER BY id DESC LIMIT ?", args).fetchall()
         return [dict(r) for r in rows]
 
+    def session_jobs(self, session_id: str, *, since: float) -> list[Job]:
+        """A session's jobs that are still live or ended after ``since``."""
+        rows = self.conn.execute(
+            "SELECT * FROM jobs WHERE session_id=? AND (finished_at IS NULL OR finished_at > ?) ORDER BY id",
+            (session_id, since),
+        ).fetchall()
+        return [_row_to_job(r) for r in rows]
+
+    def session_events(self, session_id: str, *, since: float) -> list[dict[str, object]]:
+        """Events on a session's jobs after ``since`` that the session did not cause itself."""
+        rows = self.conn.execute(
+            "SELECT e.* FROM job_events e JOIN jobs j ON j.id = e.job_id "
+            "WHERE j.session_id=? AND e.at > ? AND e.actor != ? ORDER BY e.id",
+            (session_id, since, session_id),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
     def last_event(self, job_id: int, action: str) -> dict[str, object] | None:
         row = self.conn.execute(
             "SELECT * FROM job_events WHERE job_id=? AND action=? ORDER BY id DESC LIMIT 1", (job_id, action)

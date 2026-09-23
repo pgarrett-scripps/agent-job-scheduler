@@ -115,5 +115,8 @@ class Client:
     def jobs(self, **params: Any) -> list[dict[str, Any]]:
         return list(self.call("jobs", **params))
 
+    def inbox(self, session_id: str, since: float, stall_s: float = 900.0) -> dict[str, Any]:
+        return dict(self.call("inbox", session_id=session_id, since=since, stall_s=stall_s))
+
     def logs(self, job_id: int, lines: int = 50) -> str:
         return str(self.call("logs", job_id=job_id, lines=lines))

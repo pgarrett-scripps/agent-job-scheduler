@@ -295,6 +295,34 @@ class TestRecovery:
         assert [e["action"] for e in engine.store.events(job_id=job.id)] == ["adopt"]
 
 
+class TestInbox:
+    async def test_session_sees_its_own_finished_jobs_and_what_others_did(self, engine):
+        mine = engine.submit(project="p", session_id="claude:me", cmd=["/bin/false"], cwd="/tmp")
+        other = engine.submit(project="p", session_id="claude:you", cmd=["/bin/false"], cwd="/tmp")
+        await drive(engine, mine.id)
+        await drive(engine, other.id)
+        engine.paused = True
+        queued = engine.submit(project="p", session_id="claude:me", cmd=["/bin/true"], cwd="/tmp")
+        engine.hold(queued.id, actor="claude:me", reason="my own hold is not news")
+        engine.release(queued.id, actor="claude:steward", reason="")
+
+        box = engine.inbox("claude:me", since=0.0)
+
+        assert [j["id"] for j in box["finished"]] == [mine.id]
+        assert [(e["job_id"], e["action"]) for e in box["events"]] == [(queued.id, "release")]
+        assert engine.inbox("claude:me", since=box["now"])["finished"] == []
+
+    async def test_running_job_with_a_silent_log_is_flagged(self, engine):
+        job = engine.submit(project="p", session_id="claude:me", cmd=["/bin/sleep", "5"], cwd="/tmp")
+        async with asyncio.timeout(5):
+            while engine.store.get_job(job.id).state is not JobState.RUNNING:
+                await engine.tick()
+                await asyncio.sleep(0.02)
+        box = engine.inbox("claude:me", since=0.0, stall_s=0.0)
+        assert [j["id"] for j in box["stalled"]] == [job.id]
+        await engine.cancel(job.id, "done with test")
+
+
 class TestPauseAndDrain:
     async def test_paused_scheduler_starts_nothing(self, engine):
         engine.paused = True
