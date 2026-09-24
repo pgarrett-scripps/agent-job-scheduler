@@ -261,6 +261,9 @@ def plan(
     per_project = {j.project: 0 for j in running}
     for job in running:
         per_project[job.project] += 1
+    # The per-project cap only matters when someone else is waiting: a project alone in
+    # the queue may fill the machine, since holding it back would just leave cores idle.
+    waiting_projects = {j.project for j in queued}
 
     reservation: Reservation | None = None
 
@@ -288,8 +291,10 @@ def plan(
             )
             continue
 
-        if per_project.get(job.project, 0) >= cfg.max_jobs_per_project:
-            decision.blocked[job.id] = f"project cap: {job.project} already running {cfg.max_jobs_per_project}"
+        if per_project.get(job.project, 0) >= cfg.max_jobs_per_project and waiting_projects - {job.project}:
+            decision.blocked[job.id] = (
+                f"project cap: {job.project} already running {cfg.max_jobs_per_project} while other projects wait"
+            )
             continue
 
         job_locks = _locks_of(job)

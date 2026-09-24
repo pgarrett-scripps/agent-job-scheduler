@@ -215,14 +215,27 @@ class TestFairness:
 
     def test_project_concurrency_cap(self, cap, cfg):
         running = [make_job(i, project="hog", cpu=1, state=JobState.RUNNING, started_at=NOW) for i in range(1, 5)]
-        decision = run_plan([make_job(9, project="hog", cpu=1)], running, cap=cap, cfg=cfg)
-        assert decision.start == []
+        queued = [make_job(9, project="hog", cpu=1), make_job(10, project="other", cpu=20)]
+        decision = run_plan(queued, running, cap=cap, cfg=cfg)
+        assert 9 not in decision.start
         assert "project cap" in decision.blocked[9]
 
     def test_cap_is_per_project_not_global(self, cap, cfg):
         running = [make_job(i, project="hog", cpu=1, state=JobState.RUNNING, started_at=NOW) for i in range(1, 5)]
         decision = run_plan([make_job(9, project="other", cpu=1)], running, cap=cap, cfg=cfg)
         assert decision.start == [9]
+
+    def test_cap_waived_when_no_other_project_waits(self, cap, cfg):
+        running = [make_job(i, project="hog", cpu=1, state=JobState.RUNNING, started_at=NOW) for i in range(1, 5)]
+        decision = run_plan([make_job(9, project="hog", cpu=1)], running, cap=cap, cfg=cfg)
+        assert decision.start == [9]
+
+    def test_cap_holds_while_another_project_waits(self, cap, cfg):
+        running = [make_job(i, project="hog", cpu=1, state=JobState.RUNNING, started_at=NOW) for i in range(1, 5)]
+        queued = [make_job(9, project="hog", cpu=1), make_job(10, project="other", cpu=1)]
+        decision = run_plan(queued, running, cap=cap, cfg=cfg)
+        assert 9 not in decision.start
+        assert "project cap" in decision.blocked[9]
 
     def test_fifo_within_a_project(self, cap, cfg):
         jobs = [make_job(2, submitted_at=NOW + 10), make_job(1, submitted_at=NOW)]

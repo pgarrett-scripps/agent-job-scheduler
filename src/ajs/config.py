@@ -215,8 +215,10 @@ class Config:
     default_max_runtime_s: int = 3600
     """Applied when a submission omits max_runtime. Required for backfill to work."""
 
-    max_jobs_per_project: int = 4
-    """Concurrency cap per project, so one agent cannot monopolise the queue."""
+    max_jobs_per_project: int = 8
+    """Concurrency cap per project, so one agent cannot monopolise the queue. It applies
+    only while another project has a job waiting; a project alone in the queue may run
+    as many jobs as fit."""
 
     use_systemd: bool = True
     """Run jobs in transient cgroup scopes when systemd-run is available."""
