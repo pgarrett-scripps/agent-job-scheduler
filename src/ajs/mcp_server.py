@@ -89,6 +89,10 @@ what keeps another job queued. Lower the running or queued job in place with
 that loads slowly can move the check with meta `mem_check=20m`, or turn it off with
 `mem_check=off`.
 
+A job may run `docker run`: ajs labels the containers it starts, counts their CPU and
+memory as the job's, and kills them when the job ends. Declare cpu and mem for the
+containers too.
+
 A job past its max_runtime is killed. About 10 minutes before (at 80% for short jobs)
 your inbox gets a runtime-warning; if the job needs longer, call `set_job_runtime` with
 a reason, up to twice what you submitted. Timing runs cannot be extended. If a job will

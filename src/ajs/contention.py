@@ -162,6 +162,10 @@ class ContentionMonitor:
         self.mem_peak_mb: int | None = None
         """Most anonymous memory the job has held, for telling owners they reserved too
         much. Page cache is left out: it grows to fill any limit and is reclaimable."""
+        self._extra: dict[Path, list[float]] = {}
+        """Cgroups outside the job's scope doing its work (its Docker containers), each
+        with [CPU seconds when attached, latest reading]. The latest reading outlives the
+        cgroup, so the job's CPU total never drops when a container exits."""
 
     @property
     def mem_held_mb(self) -> int | None:
@@ -198,13 +202,43 @@ class ContentionMonitor:
         """The job's cgroup, used to tell its GPU processes apart from everyone else's."""
         return self._cgroup
 
+    def attach(self, cgroup: Path) -> None:
+        """Count another cgroup's work as this job's, from now on."""
+        if cgroup in self._extra or cgroup == self._cgroup:
+            return
+        start = cgroup_cpu_seconds(cgroup)
+        if start is not None:
+            self._extra[cgroup] = [start, start]
+
+    @property
+    def extra_cgroups(self) -> set[Path]:
+        return set(self._extra)
+
+    def _extra_cpu_seconds(self) -> float:
+        total = 0.0
+        for path, reading in self._extra.items():
+            now = cgroup_cpu_seconds(path)
+            if now is not None:
+                reading[1] = now
+            total += reading[1] - reading[0]
+        return total
+
+    def _extra_sum(self, read) -> int:
+        return sum(v for path in self._extra if (v := read(path)) is not None)
+
     def current_cpu_seconds(self) -> float | None:
         """CPU seconds this job has used so far, or None if unaccounted."""
-        return cgroup_cpu_seconds(self._cgroup) if self._cgroup is not None else None
+        if self._cgroup is None:
+            return None
+        own = cgroup_cpu_seconds(self._cgroup)
+        return own + self._extra_cpu_seconds() if own is not None else None
 
     def current_mem_bytes(self) -> int | None:
         """Memory this job is using right now, or None if unaccounted."""
-        return cgroup_mem_bytes(self._cgroup) if self._cgroup is not None else None
+        if self._cgroup is None:
+            return None
+        own = cgroup_mem_bytes(self._cgroup)
+        return own + self._extra_sum(cgroup_mem_bytes) if own is not None else None
 
     def poll(self, now: float) -> tuple[float | None, int | None]:
         """Read the job's counters and remember the CPU figure.
@@ -226,6 +260,8 @@ class ContentionMonitor:
         # make every reservation look fully used. The kernel keeps no high-water mark
         # for anonymous memory alone, so the largest sampled value has to do.
         anon = cgroup_anon_bytes(self._cgroup) if self._cgroup is not None else None
+        if anon is not None:
+            anon += self._extra_sum(cgroup_anon_bytes)
         self.mem_anon_now_mb = anon // (1024 * 1024) if anon is not None else None
         if anon is not None:
             anon_mb = anon // (1024 * 1024)
@@ -246,7 +282,7 @@ class ContentionMonitor:
         measured_own = False
         stale_by = 0.0
         if self._cgroup is not None and self._cgroup_start is not None:
-            end = cgroup_cpu_seconds(self._cgroup)
+            end = self.current_cpu_seconds()
             if end is None and self._last_cpu is not None and self._last_cpu_at is not None:
                 # The cgroup is already gone; use the last sample the tick loop took.
                 end, stale_by = self._last_cpu, max(0.0, now - self._last_cpu_at)

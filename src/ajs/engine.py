@@ -17,7 +17,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
-from . import sysinfo
+from . import containers, sysinfo
 from .config import Config, db_path, log_dir
 from .contention import ContentionMonitor, ExternalLoad, ForeignProcesses
 from .db import Store
@@ -58,6 +58,8 @@ class Engine:
         """(job, max_runtime) pairs already warned, so an extension earns a fresh warning."""
         self._mem_blocking_sent: set[int] = set()
         """Running jobs whose owner was told their unused memory keeps a queued job waiting."""
+        self._containers_at = 0.0
+        """When running jobs' Docker containers were last looked for."""
         self._own_cgroups: set[Path] = set()
         self.paused = False
         self.pause_until: float | None = None
@@ -168,6 +170,7 @@ class Engine:
 
     async def tick(self) -> None:
         now = time.time()
+        await self._attach_containers(now)
         self._sample_external(now)
         self._warn_mem_underuse(now)
         self._warn_runtime(now)
@@ -235,6 +238,25 @@ class Engine:
         if decision.reservation is not None:
             self.store.update_job(decision.reservation.job_id, reserved_until=decision.reservation.start_at)
 
+    async def _attach_containers(self, now: float) -> None:
+        """Count the Docker containers each running job started as part of that job.
+
+        The job's docker shim labels them; without this their work reads as load
+        outside ajs and holds back the queue (see containers.py)."""
+        if self.executor.shim_dir is None or not self.monitors or now - self._containers_at < CONTAINER_POLL_S:
+            return
+        self._containers_at = now
+        try:
+            found = await containers.labelled()
+        except Exception:  # accounting must never stall the tick
+            log.exception("listing job containers failed")
+            return
+        for container_id, job_id in found:
+            monitor = self.monitors.get(job_id)
+            cgroup = containers.container_cgroup(container_id)
+            if monitor is not None and cgroup is not None:
+                monitor.attach(cgroup)
+
     def _sample_external(self, now: float) -> None:
         """Measure what is running on this machine that ajs did not start.
 
@@ -256,6 +278,7 @@ class Engine:
             if monitor.cgroup is None or monitor.cgroup in own_cgroups:
                 continue
             own_cgroups.add(monitor.cgroup)
+            own_cgroups |= monitor.extra_cgroups
             if cpu is not None:
                 own_cpu += cpu
             own_mem += monitor.mem_held_mb or 0
@@ -620,6 +643,12 @@ class Engine:
         with contextlib.suppress(Exception):
             await self.executor.drain(rp)
         self.running.pop(job_id, None)
+        attached = self.monitors.get(job_id)
+        if attached is not None and attached.extra_cgroups:
+            # Containers run under dockerd, not in the job's scope, so stopping the job
+            # does not stop them.
+            with contextlib.suppress(Exception):
+                await containers.kill_for_job(job_id)
         # Stamped after the drain, which can take many seconds: an `ajs inbox` answered
         # meanwhile moves its cursor past the exit time and would never see this job.
         now = self.last_finish_at = time.time()
@@ -1142,6 +1171,9 @@ def _clock(ts: float | None) -> str:
     fmt = "%H:%M" if time.localtime(ts)[:3] == time.localtime()[:3] else "%a %d %b %H:%M"
     return time.strftime(fmt, time.localtime(ts))
 
+
+CONTAINER_POLL_S = 5.0
+"""How often to look for Docker containers that running jobs have started."""
 
 MEM_UNDERUSE_MIN_WATCH_S = 60.0
 """A job watched for less than this at its end has too few samples to judge."""

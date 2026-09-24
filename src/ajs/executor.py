@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import IO
 
-from . import sysinfo
+from . import containers, sysinfo
 from .config import Config, instance_tag
 from .contention import cgroup_path_for_pid
 from .models import Job
@@ -173,6 +173,8 @@ class Executor:
             if cfg.use_systemd and not use_systemd:
                 log.warning("systemd-run is unavailable; jobs will run in plain process groups without limits")
         self._systemd = use_systemd
+        self.shim_dir = containers.install_shim(log_dir.parent / "bin")
+        """First on every job's PATH when docker is installed; see containers.py."""
 
     def _wrap(self, job: Job, need: dict[str, int]) -> tuple[list[str], str | None]:
         """Build the argv that actually gets executed, plus the cgroup unit name."""
@@ -223,6 +225,8 @@ class Executor:
         env["AJS_EXCLUSIVE"] = "1" if job.resources.exclusive else "0"
         env["AJS_GPU_EXCLUSIVE"] = "1" if job.resources.gpu_exclusive else "0"
         env["AJS_EXIT_FILE"] = str(self.exit_file(job.id))
+        if self.shim_dir is not None:
+            env["PATH"] = os.pathsep.join([str(self.shim_dir), env.get("PATH", os.defpath)])
         self.exit_file(job.id).unlink(missing_ok=True)
         if not (job.resources.gpu or job.resources.gpu_exclusive):
             # A job that did not ask for the GPU must not be able to take it by accident;
