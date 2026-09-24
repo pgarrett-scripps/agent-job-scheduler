@@ -84,6 +84,11 @@ keeps other jobs queued on an idle machine. If a job's peak stays under a quarte
 large reservation, ajs tells you in your inbox after 5 minutes (or at the end); size the
 next submission from that. A job that loads slowly can move the check with
 meta `mem_check=20m`, or turn it off with `mem_check=off`.
+
+A job past its max_runtime is killed. About 10 minutes before (at 80% for short jobs)
+your inbox gets a runtime-warning; if the job needs longer, call `set_job_runtime` with
+a reason, up to twice what you submitted. Timing runs cannot be extended. If a job will
+clearly finish early, shorten it the same way: that frees the slot sooner.
 """
 
 
@@ -353,6 +358,24 @@ def build_server() -> Any:
         and is recorded with your session in `ajs events`.
         """
         return _manage("set_priority", job_id, reason, job_class=job_class)
+
+    @mcp.tool
+    def set_job_runtime(job_id: int, max_runtime: str, reason: str) -> dict[str, Any]:
+        """Change YOUR OWN queued or running job's max_runtime, e.g. "2h".
+
+        Use it when a runtime-warning says the job is about to be killed and it needs
+        longer, or to shorten a job that will finish early. It can go up to twice the
+        submitted value; timing (exclusive) runs cannot be extended. `reason` is
+        required and recorded in `ajs events`; an extension that delays a reserved job
+        tells that job's owner.
+        """
+        if not reason.strip():
+            return {"ok": False, "error": "reason is required: say why the job needs a different ceiling"}
+        try:
+            job = _client().set_runtime(job_id, parse_duration(max_runtime), actor=session_id, reason=reason)
+            return {"ok": True, "job": _summarise(job)}
+        except (SchedulerError, ValueError) as exc:
+            return _err(exc)
 
     @mcp.tool
     def queue_events(job_id: int | None = None, limit: int = 30) -> dict[str, Any]:

@@ -14,7 +14,7 @@ import math
 import secrets
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from . import sysinfo
 from .config import Config, db_path, log_dir
@@ -53,6 +53,8 @@ class Engine:
         self._timing: set[int] = set()
         self._mem_warned: set[int] = set()
         """Running exclusive (CPU) jobs; a GPU-exclusive run is not spoiled by CPU load."""
+        self._runtime_warned: set[tuple[int, int]] = set()
+        """(job, max_runtime) pairs already warned, so an extension earns a fresh warning."""
         self._own_cgroups: set[Path] = set()
         self.paused = False
         self.pause_until: float | None = None
@@ -165,6 +167,7 @@ class Engine:
         now = time.time()
         self._sample_external(now)
         self._warn_mem_underuse(now)
+        self._warn_runtime(now)
 
         expired = self.store.expire_leases(now - self.cfg.lease_timeout_s)
         for lease_id in expired:
@@ -422,6 +425,50 @@ class Engine:
         )
         log.info("job %s uses %s of %s MB reserved", job.id, peak, reserved)
 
+    def _warn_runtime(self, now: float) -> None:
+        for job in self.store.jobs_in_state(JobState.RUNNING):
+            try:
+                self._check_runtime(job, now)
+            except Exception:  # a warning must never stall the tick
+                log.exception("runtime warning check failed for job %s", job.id)
+
+    def _check_runtime(self, job: Job, now: float) -> None:
+        """Tell the owner, once per max_runtime, that the job is about to be killed.
+
+        The event lands in the owner's `ajs inbox`, which it sees on its next turn, so the
+        notice comes early enough to act on: ``runtime_warn_s`` before the kill, or at 80%
+        for a job too short for that to mean anything."""
+        if job.started_at is None or job.cancel_reason:
+            return
+        limit = job.max_runtime_s
+        key = (job.id, limit)
+        if key in self._runtime_warned:
+            return
+        remaining = job.started_at + limit - now
+        if remaining > min(self.cfg.runtime_warn_s, limit * 0.2) or remaining <= 0:
+            return
+        self._runtime_warned.add(key)
+        warned = self.store.last_event(job.id, "runtime-warning")
+        changed = self.store.last_event(job.id, "runtime")
+        if warned is not None and (changed is None or cast(float, warned["at"]) > cast(float, changed["at"])):
+            return  # warned before a daemon restart
+        if job.resources.exclusive or job.resources.gpu_exclusive:
+            how = "a timing run cannot be extended; let it finish or resubmit with a longer max_runtime"
+        else:
+            cap = int((job.orig_max_runtime_s or limit) * self.cfg.runtime_extend_factor)
+            how = (
+                f"extend with `ajs extend {job.id} --by 30m -r WHY` (up to {cap // 60} min in total), "
+                "or save its work now"
+            )
+        self.store.add_event(
+            job.id,
+            actor="ajs",
+            action="runtime-warning",
+            detail=f"killed in {remaining / 60:.0f} min: used {(now - job.started_at) / 60:.0f} of {limit // 60} min",
+            reason=how,
+        )
+        log.info("job %s is %.0fs from its max_runtime", job.id, remaining)
+
     def _enforce_disk_floor(self) -> None:
         free = sysinfo.free_disk_mb(self.cfg.disk_watch_path)
         if free >= self.cfg.disk_floor_mb:
@@ -537,6 +584,7 @@ class Engine:
         self._interfering.discard(job_id)
         self._timing.discard(job_id)
         self._mem_warned.discard(job_id)
+        self._runtime_warned = {w for w in self._runtime_warned if w[0] != job_id}
 
         if job is not None and job.cancel_reason and "max_runtime" in job.cancel_reason:
             fields["state"] = str(JobState.TIMEOUT)
@@ -676,6 +724,70 @@ class Engine:
             )
             self.wake()
         return self._queued_job(job_id)
+
+    def set_runtime(self, job_id: int, max_runtime_s: int, *, actor: str, reason: str) -> Job:
+        """Change a queued or running job's max_runtime. Only its owner, or a person, may.
+
+        Shortening is always fine: it frees the slot sooner. Lengthening is capped at
+        ``runtime_extend_factor`` times the submitted value and refused for timing runs.
+        Backfill admitted this job on its old ceiling, so an extension past the start
+        promised to a reserved job goes ahead but delays it, and that job's owner is told.
+        """
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise ValueError(f"no such job: {job_id}")
+        if job.state not in (JobState.QUEUED, JobState.RUNNING):
+            raise ValueError(f"job {job_id} is {job.state}; only queued or running jobs can change their runtime")
+        if actor != job.session_id and not actor.startswith("user:"):
+            raise ValueError(
+                f"job {job_id} belongs to {short_actor(job.session_id)}; "
+                "only its owner or a person at a terminal can change its runtime"
+            )
+        old = job.max_runtime_s
+        if max_runtime_s == old:
+            return job
+        now = time.time()
+        elapsed = now - job.started_at if job.started_at is not None else 0.0
+        if max_runtime_s < elapsed + 60:
+            raise ValueError(
+                f"job {job_id} has already run {elapsed / 60:.0f} min; a max_runtime of "
+                f"{max_runtime_s // 60} min would kill it now (use `ajs cancel` for that)"
+            )
+        orig = job.orig_max_runtime_s or old
+        if max_runtime_s > old:
+            if job.resources.exclusive or job.resources.gpu_exclusive:
+                raise ValueError(f"job {job_id} is a timing run; timing runs cannot be extended")
+            cap = int(orig * self.cfg.runtime_extend_factor)
+            if max_runtime_s > cap:
+                raise ValueError(
+                    f"job {job_id} was submitted with {orig // 60} min; it can be extended to at most "
+                    f"{cap // 60} min. For longer, resubmit it with an honest max_runtime"
+                )
+        self.store.update_job(job_id, max_runtime_s=max_runtime_s, orig_max_runtime_s=orig)
+        self.store.add_event(
+            job_id, actor=actor, action="runtime", detail=f"{old // 60} -> {max_runtime_s // 60} min", reason=reason
+        )
+        res = self.last_decision.reservation
+        if (
+            job.started_at is not None
+            and res is not None
+            and not res.external
+            and res.job_id != job_id
+            and max_runtime_s > old
+        ):
+            delay = job.started_at + max_runtime_s - max(job.started_at + old, res.start_at)
+            if delay > 0:
+                self.store.add_event(
+                    res.job_id,
+                    actor="ajs",
+                    action="delayed",
+                    detail=f"up to {delay / 60:.0f} min",
+                    reason=f"job {job_id} was extended to {max_runtime_s // 60} min: {reason}",
+                )
+        self.wake()
+        job = self.store.get_job(job_id)
+        assert job is not None
+        return job
 
     async def cancel(self, job_id: int, reason: str = "cancelled by user") -> bool:
         job = self.store.get_job(job_id)

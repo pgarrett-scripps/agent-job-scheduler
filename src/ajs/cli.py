@@ -434,6 +434,37 @@ def priority_cmd(
             _fail(str(exc))
 
 
+@app.command(name="extend")
+def extend_cmd(
+    job_id: Annotated[int, typer.Argument(help="Your queued or running job.")],
+    by: Annotated[str, typer.Option("--by", help="Add this much: 30m, 1h. Negative shortens: --by=-20m.")] = "",
+    to: Annotated[str, typer.Option("--to", help="Set max_runtime to this instead: 2h.")] = "",
+    reason: Annotated[str, typer.Option("--reason", "-r", help="Why; recorded in `ajs events`.")] = "",
+) -> None:
+    """Lengthen or shorten your own job's max_runtime. Example: ajs extend 801 --by 30m -r "B3 is slow"
+
+    Up to twice the submitted value; timing runs cannot be extended. Shortening frees
+    the slot sooner, so do it when a job will clearly finish early."""
+    if bool(by) == bool(to):
+        _fail("give exactly one of --by or --to")
+        return
+    if not reason.strip():
+        _fail("--reason is required")
+        return
+    client = _client()
+    try:
+        job = client.job(job_id)
+        seconds = parse_duration(to) if to else job["max_runtime_s"] + parse_duration(by)
+        job = client.set_runtime(job_id, seconds, actor=session_identity(), reason=reason)
+    except ValueError as exc:
+        _fail(str(exc))
+        return
+    except protocol.SchedulerError as exc:
+        _fail(str(exc))
+        return
+    console.print(f"job {job_id} max_runtime -> [bold]{job['max_runtime_s'] // 60} min[/bold]")
+
+
 @app.command(name="events")
 def events_cmd(
     job_id: Annotated[int | None, typer.Argument(help="Only this job.")] = None,

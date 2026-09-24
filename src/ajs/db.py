@@ -89,6 +89,7 @@ _ADDED_COLUMNS = (
     ("meta", "TEXT NOT NULL DEFAULT '{}'"),
     ("hold_until", "REAL"),
     ("deps", "TEXT NOT NULL DEFAULT '{}'"),  # {"ok": [ids], "any": [ids]}
+    ("orig_max_runtime_s", "INTEGER"),  # set when `ajs extend` first changes max_runtime
 )
 
 
@@ -318,6 +319,7 @@ def _row_to_job(row: sqlite3.Row) -> Job:
         contended=bool(row["contended"]),
         contention_note=row["contention_note"],
         reserved_until=row["reserved_until"],
+        orig_max_runtime_s=row["orig_max_runtime_s"],
         cancel_reason=row["cancel_reason"],
         held=bool(row["held"]),
         hold_until=row["hold_until"],

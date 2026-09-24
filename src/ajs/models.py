@@ -126,6 +126,8 @@ class Job:
     contention_note: str | None = None
     # Set when the scheduler promises a starved job a start time (see scheduler.plan).
     reserved_until: float | None = None
+    orig_max_runtime_s: int | None = None
+    """The max_runtime first submitted, once `ajs extend` has changed it; caps extensions."""
     cancel_reason: str | None = None
     # A held job stays queued but is never admitted until released. Queue management,
     # not a lifecycle state: it can be flipped back and forth while the job waits.
@@ -185,6 +187,7 @@ class Job:
             "contended": self.contended,
             "contention_note": self.contention_note,
             "reserved_until": self.reserved_until,
+            "orig_max_runtime_s": self.orig_max_runtime_s,
             "cancel_reason": self.cancel_reason,
             "held": self.held,
             "hold_until": self.hold_until,

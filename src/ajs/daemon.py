@@ -144,6 +144,9 @@ class Server:
     def do_set_priority(self, job_id: int, job_class: str, actor: str = "", reason: str = "") -> dict[str, Any]:
         return self.engine.set_priority(int(job_id), job_class, actor=actor, reason=reason).to_dict()
 
+    def do_set_runtime(self, job_id: int, max_runtime_s: int, actor: str = "", reason: str = "") -> dict[str, Any]:
+        return self.engine.set_runtime(int(job_id), int(max_runtime_s), actor=actor, reason=reason).to_dict()
+
     def do_events(self, job_id: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
         return self.engine.store.events(job_id=None if job_id is None else int(job_id), limit=int(limit))
 

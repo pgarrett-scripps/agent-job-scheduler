@@ -601,6 +601,88 @@ class TestMemUnderuse:
         assert not self._warnings(engine, off.id)
 
 
+class TestRuntime:
+    """Owners hear before max_runtime kills a job, and can move the ceiling themselves."""
+
+    def _running(self, engine, *, max_s=3600, age_s=0, session="s", **kw):
+        job = engine.submit(project="p", session_id=session, cmd=["/bin/true"], cwd="/tmp", max_runtime_s=max_s, **kw)
+        engine.store.update_job(job.id, state="running", started_at=time.time() - age_s)
+        return engine.store.get_job(job.id)
+
+    def _events(self, engine, job_id, action):
+        return [e for e in engine.store.events(job_id=job_id) if e["action"] == action]
+
+    def test_warns_once_ten_minutes_before_the_kill(self, engine):
+        early = self._running(engine, age_s=2000)
+        engine._check_runtime(early, time.time())
+        assert not self._events(engine, early.id, "runtime-warning")
+        job = self._running(engine, age_s=3100)
+        engine._check_runtime(job, time.time())
+        engine._check_runtime(job, time.time())
+        (event,) = self._events(engine, job.id, "runtime-warning")
+        assert event["detail"] == "killed in 8 min: used 52 of 60 min"
+        assert f"ajs extend {job.id}" in event["reason"] and "120 min" in event["reason"]
+        assert engine.store.session_events("s", since=0)  # reaches the owner's inbox
+
+    def test_short_jobs_are_warned_at_80_percent(self, engine):
+        job = self._running(engine, max_s=1000, age_s=700)
+        engine._check_runtime(job, time.time())
+        assert not self._events(engine, job.id, "runtime-warning")
+        engine._check_runtime(job, time.time() + 110)
+        assert self._events(engine, job.id, "runtime-warning")
+
+    def test_an_extension_earns_a_fresh_warning(self, engine):
+        job = self._running(engine, age_s=3100)
+        engine._check_runtime(job, time.time())
+        job = engine.set_runtime(job.id, 4000, actor="s", reason="slow sample")
+        engine._check_runtime(job, time.time() + 400)
+        assert len(self._events(engine, job.id, "runtime-warning")) == 2
+
+    def test_owner_extends_and_shortens_within_the_cap(self, engine):
+        job = self._running(engine, max_s=3600, age_s=600)
+        job = engine.set_runtime(job.id, 7200, actor="s", reason="needs more")
+        assert job.max_runtime_s == 7200 and job.orig_max_runtime_s == 3600
+        with pytest.raises(ValueError, match="at most 120 min"):
+            engine.set_runtime(job.id, 7300, actor="s", reason="more still")
+        job = engine.set_runtime(job.id, 1800, actor="s", reason="finishing early")
+        assert job.max_runtime_s == 1800 and job.orig_max_runtime_s == 3600
+        (latest, first) = self._events(engine, job.id, "runtime")  # newest first
+        assert first["detail"] == "60 -> 120 min" and first["actor"] == "s"
+
+    def test_cannot_shorten_below_what_has_run(self, engine):
+        job = self._running(engine, max_s=3600, age_s=1800)
+        with pytest.raises(ValueError, match="would kill it now"):
+            engine.set_runtime(job.id, 1800, actor="s", reason="x")
+
+    def test_only_the_owner_or_a_person_may_change_it(self, engine):
+        job = self._running(engine, session="claude:owner")
+        with pytest.raises(ValueError, match="only its owner"):
+            engine.set_runtime(job.id, 4000, actor="claude:other", reason="x")
+        assert engine.set_runtime(job.id, 4000, actor="user:patrick", reason="x").max_runtime_s == 4000
+
+    def test_timing_runs_cannot_be_extended_but_can_be_shortened(self, engine):
+        job = self._running(engine, exclusive=True)
+        with pytest.raises(ValueError, match="timing run"):
+            engine.set_runtime(job.id, 4000, actor="s", reason="x")
+        assert engine.set_runtime(job.id, 3000, actor="s", reason="x").max_runtime_s == 3000
+        engine._check_runtime(engine.store.get_job(job.id), time.time() + 2500)
+        (event,) = self._events(engine, job.id, "runtime-warning")
+        assert "cannot be extended" in event["reason"]
+
+    def test_an_extension_past_a_reservation_tells_the_reserved_owner(self, engine):
+        from ajs.scheduler import Decision, Reservation
+
+        job = self._running(engine, max_s=3600, age_s=1800)
+        big = engine.submit(project="q", session_id="other", cmd=["/bin/true"], cwd="/tmp", cpu=4)
+        engine.last_decision = Decision(
+            reservation=Reservation(job_id=big.id, start_at=job.started_at + 3600, needs={})
+        )
+        engine.set_runtime(job.id, 5400, actor="s", reason="B3 is slow")
+        (event,) = self._events(engine, big.id, "delayed")
+        assert event["detail"] == "up to 30 min" and "B3 is slow" in event["reason"]
+        assert engine.store.session_events("other", since=0)
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [(None, 300), ("20m", 1200), ("90", 90), ("off", None), ("inf", 300), ("1e400m", 300), ("-5m", 300), ("x", 300)],

@@ -128,6 +128,14 @@ class Config:
     is not flagged. A job can move its own check with ``--meta mem_check=20m`` (or
     ``off``); jobs that end sooner are judged when they finish."""
 
+    runtime_warn_s: int = 600
+    """Warn a job's owner this long before max_runtime kills it, so it can `ajs extend`
+    or save its work. Jobs shorter than five times this are warned at 80% instead."""
+
+    runtime_extend_factor: float = 2.0
+    """`ajs extend` can raise a job's max_runtime to at most this multiple of what it was
+    submitted with, so an extension cannot stand in for an honest estimate."""
+
     disk_floor_mb: int = 5120
     """Hard floor on free disk. Jobs are refused admission below this. Protects the root
     filesystem from a job that writes large output.
