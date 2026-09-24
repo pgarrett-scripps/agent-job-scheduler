@@ -13,7 +13,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from rich.console import Group, RenderableType
+from rich.console import Console, Group, RenderableType
 from rich.table import Table
 from rich.text import Text
 
@@ -187,18 +187,29 @@ def _running_table(jobs: list[dict[str, Any]], now: float) -> RenderableType:
     return table
 
 
-def _queued_table(jobs: list[dict[str, Any]], now: float) -> RenderableType:
+QUEUE_CHROME_LINES = 5
+"""Lines a queue table spends on its title, borders and header row."""
+
+
+def _queued_table(jobs: list[dict[str, Any]], now: float, *, window: tuple[int, int] | None = None) -> RenderableType:
+    """The queue, or the ``window`` (start, end) slice of it when the view scrolls.
+
+    A scrolled view keeps each job on one line, so the rows that fit can be counted."""
     if not jobs:
         return Text("queue empty", style="dim")
-    table = Table(title=f"queued ({len(jobs)})", title_justify="left", header_style="bold", expand=True)
+    title = f"queued ({len(jobs)})"
+    if window is not None and (window[0] > 0 or window[1] < len(jobs)):
+        title += f"  rows {window[0] + 1}-{window[1]} of {len(jobs)}   up/down, pgup/pgdn, g/G to scroll"
+    table = Table(title=title, title_justify="left", header_style="bold", expand=True)
     table.add_column("id", justify="right", no_wrap=True)
     table.add_column("project", no_wrap=True)
     table.add_column("class", no_wrap=True)
     table.add_column("needs", no_wrap=True)
     table.add_column("waited", justify="right", no_wrap=True)
-    table.add_column("waiting on", overflow="fold", ratio=2)
-    table.add_column("job", overflow="ellipsis", ratio=1)
-    for job in jobs:
+    scrolled = window is not None
+    table.add_column("waiting on", ratio=2, no_wrap=scrolled, overflow="ellipsis" if scrolled else "fold")
+    table.add_column("job", overflow="ellipsis", ratio=1, no_wrap=scrolled)
+    for job in jobs if window is None else jobs[window[0] : window[1]]:
         needs = f"{job['cpu']}cpu {fmt_mem(job['mem_mb'])}"
         if job.get("gpu_mem_mb"):
             needs += f" {fmt_mem(job['gpu_mem_mb'])}vram"
@@ -232,19 +243,46 @@ def _reservation_line(data: dict[str, Any]) -> Text | None:
 
 
 def render(data: dict[str, Any], now: float | None = None) -> RenderableType:
-    """One frame of `ajs top` from a `status` payload."""
+    """One frame of `ajs top` from a `status` payload, with the whole queue."""
+    frame, _ = render_frame(data, now)
+    return frame
+
+
+def render_frame(
+    data: dict[str, Any],
+    now: float | None = None,
+    *,
+    console: Console | None = None,
+    offset: int = 0,
+) -> tuple[RenderableType, int]:
+    """One frame, and the largest queue offset that still fills the screen.
+
+    With a ``console``, the queue is cut to the rows left once everything else is drawn,
+    starting ``offset`` jobs in, so a long queue scrolls instead of running off the
+    bottom of the screen. Without one, the whole queue is drawn."""
     now = time.time() if now is None else now
-    parts: list[RenderableType] = [
+    queued = data.get("queued") or []
+    head: list[RenderableType] = [
         _header(data),
         _capacity_rows(data),
         *([measured] if (measured := _measured_rows(data)) is not None else []),
         Text(""),
         _running_table(data.get("running") or [], now),
         Text(""),
-        _queued_table(data.get("queued") or [], now),
     ]
+    tail: list[RenderableType] = []
     line = _reservation_line(data)
     if line is not None:
-        parts.append(line)
-    parts.append(Text(time.strftime("%H:%M:%S", time.localtime(now)) + "   ctrl-c to quit", style="dim"))
-    return Group(*parts)
+        tail.append(line)
+    hint = "q or ctrl-c to quit" if console is not None else "ctrl-c to quit"
+    tail.append(Text(time.strftime("%H:%M:%S", time.localtime(now)) + "   " + hint, style="dim"))
+
+    max_offset = 0
+    window = None
+    if console is not None and queued:
+        used = len(console.render_lines(Group(*head, *tail), console.options, pad=False))
+        rows = max(1, console.size.height - used - QUEUE_CHROME_LINES)
+        max_offset = max(0, len(queued) - rows)
+        start = min(max(0, offset), max_offset)
+        window = (start, min(len(queued), start + rows))
+    return Group(*head, _queued_table(queued, now, window=window), *tail), max_offset

@@ -138,3 +138,35 @@ def test_measured_breakdown_names_outside_processes():
     assert "cc1" in out and "~/Repos/tacular-omics" in out
     assert out.count("42") >= 1
     assert "!1" in out
+
+
+def _long_queue(n):
+    payload = _payload()
+    job = payload["queued"][0]
+    payload["queued"] = [{**job, "id": 100 + i, "exclusive": False} for i in range(n)]
+    return payload
+
+
+def test_long_queue_scrolls_to_fit_the_screen():
+    from ajs.top import render_frame
+
+    console = Console(record=True, width=140, height=30, force_terminal=False, color_system=None)
+    frame, max_offset = render_frame(_long_queue(60), now=NOW, console=console)
+    console.print(frame)
+    top = console.export_text()
+    assert max_offset > 0
+    assert "rows 1-" in top and "of 60" in top and "100" in top and "159" not in top
+    assert len(top.splitlines()) <= 30
+
+    frame, _ = render_frame(_long_queue(60), now=NOW, console=console, offset=10**9)
+    console.print(frame)
+    bottom = console.export_text()
+    assert "159" in bottom and "of 60" in bottom
+
+
+def test_short_queue_needs_no_scrolling():
+    from ajs.top import render_frame
+
+    console = Console(width=140, height=60, force_terminal=False, color_system=None)
+    _, max_offset = render_frame(_long_queue(3), now=NOW, console=console)
+    assert max_offset == 0

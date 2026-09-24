@@ -717,10 +717,11 @@ def top_cmd(
     once: Annotated[bool, typer.Option("--once", help="Print one frame and exit.")] = False,
 ) -> None:
     """Live view: capacity bars, running jobs with actual vs declared usage, and the queue."""
+    from rich.console import RenderableType
     from rich.live import Live
     from rich.text import Text
 
-    from .top import render
+    from .top import render, render_frame
 
     client = _client()
     try:
@@ -732,18 +733,92 @@ def top_cmd(
         console.print(render(data))
         return
 
+    offset = 0
+    max_offset = 0
+
+    def draw() -> RenderableType:
+        nonlocal max_offset
+        frame, max_offset = render_frame(data, console=console, offset=offset)
+        return frame
+
     try:
-        with Live(render(data), console=console, screen=True, refresh_per_second=4) as live:
+        with _Keys() as keys, Live(draw(), console=console, screen=True, auto_refresh=False) as live:
+            next_fetch = time.monotonic() + max(0.2, interval)
             while True:
-                time.sleep(max(0.2, interval))
-                try:
-                    data = client.status()
-                except protocol.SchedulerError as exc:
-                    live.update(Text(f"error: {exc}\n(retrying)", style="red"))
-                    continue
-                live.update(render(data))
+                key = keys.read(timeout=max(0.0, next_fetch - time.monotonic()))
+                if key == "quit":
+                    return
+                if key is not None:
+                    page = max(1, console.size.height // 2)
+                    step = {"up": -1, "down": 1, "pgup": -page, "pgdn": page, "top": -(10**9), "end": 10**9}
+                    offset = min(max(0, offset + step.get(key, 0)), max_offset)
+                if time.monotonic() >= next_fetch:
+                    next_fetch = time.monotonic() + max(0.2, interval)
+                    try:
+                        data = client.status()
+                    except protocol.SchedulerError as exc:
+                        live.update(Text(f"error: {exc}\n(retrying)", style="red"), refresh=True)
+                        continue
+                live.update(draw(), refresh=True)
     except KeyboardInterrupt:
         return
+
+
+class _Keys:
+    """Single keypresses from the terminal for `ajs top`, without waiting for Enter.
+
+    Off a terminal (piped stdin), reads nothing and only paces the refresh."""
+
+    _SEQUENCES = {
+        "\x1b[A": "up",
+        "\x1b[B": "down",
+        "\x1b[5~": "pgup",
+        "\x1b[6~": "pgdn",
+        "\x1b[H": "top",
+        "\x1b[F": "end",
+        "k": "up",
+        "j": "down",
+        " ": "pgdn",
+        "b": "pgup",
+        "g": "top",
+        "G": "end",
+        "q": "quit",
+    }
+
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._saved: list[Any] | None = None
+
+    def __enter__(self) -> _Keys:
+        import sys
+        import termios
+        import tty
+
+        if sys.stdin.isatty():
+            self._fd = sys.stdin.fileno()
+            self._saved = termios.tcgetattr(self._fd)
+            tty.setcbreak(self._fd)
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        import termios
+
+        if self._fd is not None and self._saved is not None:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._saved)
+
+    def read(self, timeout: float) -> str | None:
+        """The next key's name, or None if nothing was pressed within ``timeout``."""
+        import os
+        import select
+
+        if self._fd is None:
+            time.sleep(timeout)
+            return None
+        ready, _, _ = select.select([self._fd], [], [], timeout)
+        if not ready:
+            return None
+        raw = os.read(self._fd, 32).decode(errors="ignore")
+        return self._SEQUENCES.get(raw, self._SEQUENCES.get(raw[:1]) if not raw.startswith("\x1b") else None)
 
 
 @app.command(name="ps")
