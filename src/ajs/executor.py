@@ -256,8 +256,12 @@ class Executor:
         Only a job in its own scope can have survived: without systemd it lived in the
         daemon's cgroup and went down with it. The PID must still sit in the job's scope,
         which also rules out the PID having been reused by something else.
+
+        This reads /proc and never asks systemd, so it works even when this daemon could
+        not reach systemd at startup. Failing the job then would free its resources while
+        it kept running, and the scheduler would pile new jobs on top of it.
         """
-        if not self._systemd or not job.unit or not job.pid:
+        if not job.unit or not job.pid:
             return None
         cgroup = cgroup_path_for_pid(job.pid)
         if cgroup is None or cgroup.name != job.unit:

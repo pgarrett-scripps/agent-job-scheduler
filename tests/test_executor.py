@@ -118,3 +118,24 @@ class TestUnitNamespacing:
         from ajs.config import Config
 
         assert Executor(Config(), tmp_path, use_systemd=False).orphan_units() == []
+
+
+def test_a_scoped_job_is_adopted_even_when_systemd_is_unreachable(tmp_path, monkeypatch):
+    """Failing it instead would free its resources while it kept running."""
+    import os
+
+    from ajs import executor as executor_mod
+    from ajs.config import Config
+    from ajs.executor import Executor
+    from ajs.models import JobState
+
+    from .conftest import make_job
+
+    ex = Executor(Config(), tmp_path, use_systemd=False)
+    job = make_job(7, state=JobState.RUNNING)
+    job.unit, job.pid = "ajs-x-job-7.scope", os.getpid()
+    monkeypatch.setattr(executor_mod, "cgroup_path_for_pid", lambda pid: tmp_path / "ajs-x-job-7.scope")
+    rp = ex.adopt(job)
+    assert rp is not None and rp.unit == job.unit
+    monkeypatch.setattr(executor_mod, "cgroup_path_for_pid", lambda pid: tmp_path / "someone-else.scope")
+    assert ex.adopt(job) is None
