@@ -80,10 +80,13 @@ explicitly asked you to in this conversation. Cancelling your own job stays fine
 When you do queue something, declare `cpu` and `mem` honestly. The scheduler hands out
 slots based on what you claim, so under-declaring causes the overloading this exists to
 prevent. Over-declaring wastes it the other way: memory you reserve and never touch
-keeps other jobs queued on an idle machine. If a job's peak stays under a quarter of a
-large reservation, ajs tells you in your inbox after 5 minutes (or at the end); size the
-next submission from that. A job that loads slowly can move the check with
-meta `mem_check=20m`, or turn it off with `mem_check=off`.
+keeps other jobs queued on an idle machine. CPU is overbooked for ordinary jobs, so
+memory is what decides how many run at once: declare your real peak plus about 20%.
+If a job's peak stays under 60% of its reservation (with 4 GB or more unused), ajs tells
+you in your inbox after 5 minutes (or at the end), and again if that unused memory is
+what keeps another job queued; size your queued and next submissions from that. A job
+that loads slowly can move the check with meta `mem_check=20m`, or turn it off with
+`mem_check=off`.
 
 A job past its max_runtime is killed. About 10 minutes before (at 80% for short jobs)
 your inbox gets a runtime-warning; if the job needs longer, call `set_job_runtime` with

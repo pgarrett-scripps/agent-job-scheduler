@@ -55,6 +55,8 @@ class Engine:
         """Running exclusive (CPU) jobs; a GPU-exclusive run is not spoiled by CPU load."""
         self._runtime_warned: set[tuple[int, int]] = set()
         """(job, max_runtime) pairs already warned, so an extension earns a fresh warning."""
+        self._mem_blocking_sent: set[int] = set()
+        """Running jobs whose owner was told their unused memory keeps a queued job waiting."""
         self._own_cgroups: set[Path] = set()
         self.paused = False
         self.pause_until: float | None = None
@@ -216,6 +218,10 @@ class Engine:
         )
         self.last_decision = decision
         self.settling_since = {j: self.settling_since.get(j, now) for j in decision.settling}
+        try:
+            self._nudge_mem_blockers(now, queued, running, decision)
+        except Exception:  # a note must never stall the tick
+            log.exception("memory blocking check failed")
         for job_id, why in decision.unquiet_start.items():
             self.interference.setdefault(job_id, []).append(why)
             self.store.add_event(job_id, actor="ajs", action="unquiet-start", detail=why)
@@ -402,14 +408,8 @@ class Engine:
         current use, so a job between phases is not flagged; judged at the job's
         ``mem_check`` age, or at its end if it finishes sooner."""
         reserved = job.resources.mem_mb
-        peak = monitor.mem_peak_mb
-        if job.started_at is None or peak is None or reserved < self.cfg.mem_underuse_min_mb:
-            return
-        after = mem_check_after(job.meta.get("mem_check"), self.cfg.mem_underuse_after_s)
-        # The peak covers only what this daemon has watched: after a restart that starts
-        # at the adoption, and one sample taken between two steps of a script reads zero.
-        watched = now - max(job.started_at, monitor.watched_since)
-        if after is None or watched < (MEM_UNDERUSE_MIN_WATCH_S if final else after):
+        peak = self._judged_peak(job, monitor, now, final=final)
+        if peak is None or reserved - peak < self.cfg.mem_underuse_min_mb:
             return
         if peak >= reserved * self.cfg.mem_underuse_ratio:
             return
@@ -419,7 +419,7 @@ class Engine:
         if self.store.last_event(job.id, "mem-underuse") is not None:
             return  # warned before a daemon restart
         suggest_gb = max(1, -(-int(peak * 1.25) // 1024))
-        minutes = (now - job.started_at) / 60
+        minutes = (now - (job.started_at or now)) / 60
         self.store.add_event(
             job.id,
             actor="ajs",
@@ -431,6 +431,68 @@ class Engine:
             ),
         )
         log.info("job %s uses %s of %s MB reserved", job.id, peak, reserved)
+
+    def _judged_peak(self, job: Job, monitor: ContentionMonitor, now: float, *, final: bool) -> int | None:
+        """The job's memory peak, once it has been watched long enough to judge; else None."""
+        peak = monitor.mem_peak_mb
+        if job.started_at is None or peak is None:
+            return None
+        after = mem_check_after(job.meta.get("mem_check"), self.cfg.mem_underuse_after_s)
+        # The peak covers only what this daemon has watched: after a restart that starts
+        # at the adoption, and one sample taken between two steps of a script reads zero.
+        watched = now - max(job.started_at, monitor.watched_since)
+        if after is None or watched < (MEM_UNDERUSE_MIN_WATCH_S if final else after):
+            return None
+        return peak
+
+    def _nudge_mem_blockers(self, now: float, queued: list[Job], running: list[Job], decision: Decision) -> None:
+        """Tell the owner of a running job, once, when memory it reserved but never used
+        is what keeps a queued job waiting.
+
+        The reservation cannot shrink while the job runs, so the note is about the
+        owner's queued and future jobs of the same kind: those are what free the memory."""
+        waiting = [
+            j for j in queued if j.id in decision.blocked and not j.resources.exclusive and j.id not in decision.start
+        ]
+        if not waiting:
+            return
+        external = (self._external_usage() or {}).get("mem_mb", 0)
+        leases = self._lease_usage()["mem_mb"]
+        free = self.cap.mem_mb - sum(r.resources.mem_mb for r in running) - leases - external
+        headroom = self._mem_headroom(running)
+        if headroom is not None:
+            free = min(free, headroom)
+        for job in running:
+            monitor = self.monitors.get(job.id)
+            if job.resources.exclusive or monitor is None or job.id in self._mem_blocking_sent:
+                continue
+            peak = self._judged_peak(job, monitor, now, final=False)
+            if peak is None:
+                continue
+            suggest_mb = -(-int(peak * 1.25) // 1024) * 1024
+            idle = job.resources.mem_mb - suggest_mb
+            if idle < self.cfg.mem_underuse_min_mb:
+                continue
+            victim = next((j for j in waiting if free < j.resources.mem_mb <= free + idle), None)
+            if victim is None:
+                continue
+            self._mem_blocking_sent.add(job.id)
+            if self.store.last_event(job.id, "mem-blocking") is not None:
+                continue  # sent before a daemon restart
+            self.store.add_event(
+                job.id,
+                actor="ajs",
+                action="mem-blocking",
+                detail=(
+                    f"peak {peak / 1024:.1f} of {job.resources.mem_mb / 1024:.0f} GB reserved; job "
+                    f"{victim.id} ({victim.project}, {victim.resources.mem_mb / 1024:.0f} GB) is waiting for memory"
+                ),
+                reason=(
+                    f"reserve about {suggest_mb // 1024}G for jobs like this: cancel and resubmit your queued "
+                    "ones with the lower figure, and use it next time"
+                ),
+            )
+            log.info("job %s holds %s MB it does not use while job %s waits", job.id, idle, victim.id)
 
     def _warn_runtime(self, now: float) -> None:
         for job in self.store.jobs_in_state(JobState.RUNNING):

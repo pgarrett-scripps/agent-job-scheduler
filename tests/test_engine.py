@@ -582,9 +582,37 @@ class TestMemUnderuse:
         assert self._warnings(engine, job.id)
 
     def test_a_job_using_its_reservation_is_left_alone(self, engine):
-        job, monitor = self._job(engine, 1500, age_s=600)
+        job, monitor = self._job(engine, 2500, age_s=600)
         engine._check_mem_underuse(job, monitor, time.time(), final=True)
         assert not self._warnings(engine, job.id)
+
+    def test_a_small_unused_remainder_is_left_alone(self, engine):
+        job, monitor = self._job(engine, 2000, age_s=600)
+        engine.cfg.mem_underuse_min_mb = 2500  # half unused, but only 2 GB of it
+        engine._check_mem_underuse(job, monitor, time.time(), final=True)
+        assert not self._warnings(engine, job.id)
+
+    def _blocking(self, engine, monkeypatch, peak_mb, waiting_mb):
+        from ajs.scheduler import Decision
+
+        monkeypatch.setattr(engine, "_mem_headroom", lambda running: None)
+        job, monitor = self._job(engine, peak_mb, age_s=600)
+        engine.store.update_job(job.id, state="running")
+        engine.monitors[job.id] = monitor
+        queued = engine.submit(project="q", session_id="other", cmd=["/bin/true"], cwd="/tmp", mem_mb=waiting_mb)
+        running = [engine.store.get_job(job.id)]
+        for _ in range(2):
+            engine._nudge_mem_blockers(time.time(), [queued], running, Decision(blocked={queued.id: "waiting"}))
+        return [e for e in engine.store.events(job_id=job.id) if e["action"] == "mem-blocking"]
+
+    def test_owner_hears_once_when_unused_memory_blocks_a_queued_job(self, engine, monkeypatch):
+        (event,) = self._blocking(engine, monkeypatch, 500, 2000)
+        assert "job 2 (q, 2 GB) is waiting for memory" in event["detail"]
+        assert "reserve about 1G" in event["reason"]
+        assert any(e["action"] == "mem-blocking" for e in engine.store.session_events("s", since=0))
+
+    def test_no_note_when_freeing_the_unused_memory_would_not_be_enough(self, engine, monkeypatch):
+        assert not self._blocking(engine, monkeypatch, 3000, 2000)
 
     def test_an_adopted_job_is_judged_on_the_time_since_adoption(self, engine):
         job, monitor = self._job(engine, 0, age_s=600)
