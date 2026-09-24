@@ -13,6 +13,7 @@ import logging
 import math
 import secrets
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -425,8 +426,9 @@ class Engine:
             action="mem-underuse",
             detail=f"peak {peak / 1024:.1f} of {reserved / 1024:.0f} GB reserved after {minutes:.0f} min",
             reason=(
-                f"reserve about {suggest_gb}G next time; the unused reservation keeps other jobs "
-                "queued (move this check with --meta mem_check=20m, or =off)"
+                f"reserve about {suggest_gb}G next time, or lower this one now with "
+                f"`ajs resize {job.id} --mem {suggest_gb}G -r WHY`; the unused reservation keeps other "
+                "jobs queued (move this check with --meta mem_check=20m, or =off)"
             ),
         )
         log.info("job %s uses %s of %s MB reserved", job.id, peak, reserved)
@@ -448,8 +450,8 @@ class Engine:
         """Tell the owner of a running job, once, when memory it reserved but never used
         is what keeps a queued job waiting.
 
-        The reservation cannot shrink while the job runs, so the note is about the
-        owner's queued and future jobs of the same kind: those are what free the memory."""
+        The owner can shrink it in place with `ajs resize`, and should size its queued
+        and future jobs of the same kind from the peak."""
         waiting = [
             j for j in queued if j.id in decision.blocked and not j.resources.exclusive and j.id not in decision.start
         ]
@@ -487,8 +489,8 @@ class Engine:
                     f"{victim.id} ({victim.project}, {victim.resources.mem_mb / 1024:.0f} GB) is waiting for memory"
                 ),
                 reason=(
-                    f"reserve about {suggest_mb // 1024}G for jobs like this: cancel and resubmit your queued "
-                    "ones with the lower figure, and use it next time"
+                    f"lower it now with `ajs resize {job.id} --mem {suggest_mb // 1024}G -r WHY`, and reserve "
+                    "about that for your queued and future jobs like it"
                 ),
             )
             log.info("job %s holds %s MB it does not use while job %s waits", job.id, idle, victim.id)
@@ -857,6 +859,58 @@ class Engine:
         assert job is not None
         return job
 
+    def set_mem(self, job_id: int, mem_mb: int, *, actor: str, reason: str) -> Job:
+        """Lower a queued or running job's memory reservation. Only its owner, or a person, may.
+
+        Lowering only: raising would take memory ahead of jobs already waiting for it, so
+        that is a resubmission. A running job's cgroup limit is lowered with it, and not
+        below what the job has been seen to use plus a margin, so the shrink cannot get
+        it OOM-killed on the spot."""
+        job = self.store.get_job(job_id)
+        if job is None:
+            raise ValueError(f"no such job: {job_id}")
+        if job.state not in (JobState.QUEUED, JobState.RUNNING):
+            raise ValueError(f"job {job_id} is {job.state}; only queued or running jobs can change their memory")
+        if actor != job.session_id and not actor.startswith("user:"):
+            raise ValueError(
+                f"job {job_id} belongs to {short_actor(job.session_id)}; "
+                "only its owner or a person at a terminal can change its memory"
+            )
+        old = job.resources.mem_mb
+        if mem_mb == old:
+            return job
+        if mem_mb > old:
+            raise ValueError(
+                f"job {job_id} reserves {old} MB; resize can only lower it. "
+                "To reserve more, cancel and resubmit so the job queues for the memory"
+            )
+        if mem_mb < MEM_RESIZE_MIN_MB:
+            raise ValueError(f"{mem_mb} MB is too small; the least a job can reserve is {MEM_RESIZE_MIN_MB} MB")
+        if job.state == JobState.RUNNING:
+            monitor = self.monitors.get(job_id)
+            now = time.time()
+            if monitor is None or now - max(job.started_at or now, monitor.watched_since) < MEM_RESIZE_MIN_WATCH_S:
+                raise ValueError(
+                    f"job {job_id} has not been watched long enough to know its memory use; try again in a minute"
+                )
+            used = max(monitor.mem_peak_mb or 0, monitor.mem_held_mb or 0)
+            floor = int(used * MEM_RESIZE_MARGIN) + MEM_RESIZE_MIN_MB
+            if mem_mb < floor:
+                raise ValueError(f"job {job_id} has used up to {used} MB; it can be lowered to {floor} MB at the least")
+            rp = self.running.get(job_id)
+            if rp is not None and rp.unit and self.cfg.enforce_limits:
+                if not self.executor.set_mem_limit(rp.unit, mem_mb):
+                    raise ValueError(f"could not lower job {job_id}'s cgroup limit; its reservation is unchanged")
+        resources = replace(job.resources, mem_mb=mem_mb)
+        self.store.update_job(job_id, resources=resources.to_json())
+        self.store.add_event(
+            job_id, actor=actor, action="mem", detail=f"{old / 1024:.1f} -> {mem_mb / 1024:.1f} GB", reason=reason
+        )
+        self.wake()
+        job = self.store.get_job(job_id)
+        assert job is not None
+        return job
+
     async def cancel(self, job_id: int, reason: str = "cancelled by user") -> bool:
         job = self.store.get_job(job_id)
         if job is None or job.state.is_terminal:
@@ -1091,6 +1145,14 @@ def _clock(ts: float | None) -> str:
 
 MEM_UNDERUSE_MIN_WATCH_S = 60.0
 """A job watched for less than this at its end has too few samples to judge."""
+
+MEM_RESIZE_MIN_WATCH_S = 60.0
+"""A running job must have been watched this long before its memory can be lowered."""
+
+MEM_RESIZE_MARGIN = 1.2
+MEM_RESIZE_MIN_MB = 512
+"""A running job can be lowered to its peak so far times the margin, plus this, and no
+further; nor can any job reserve less than this."""
 
 
 def mem_check_after(value: str | None, default_s: int) -> int | None:

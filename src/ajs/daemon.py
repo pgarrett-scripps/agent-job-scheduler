@@ -147,6 +147,9 @@ class Server:
     def do_set_runtime(self, job_id: int, max_runtime_s: int, actor: str = "", reason: str = "") -> dict[str, Any]:
         return self.engine.set_runtime(int(job_id), int(max_runtime_s), actor=actor, reason=reason).to_dict()
 
+    def do_set_mem(self, job_id: int, mem_mb: int, actor: str = "", reason: str = "") -> dict[str, Any]:
+        return self.engine.set_mem(int(job_id), int(mem_mb), actor=actor, reason=reason).to_dict()
+
     def do_events(self, job_id: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
         return self.engine.store.events(job_id=None if job_id is None else int(job_id), limit=int(limit))
 

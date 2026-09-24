@@ -84,7 +84,8 @@ keeps other jobs queued on an idle machine. CPU is overbooked for ordinary jobs,
 memory is what decides how many run at once: declare your real peak plus about 20%.
 If a job's peak stays under 60% of its reservation (with 4 GB or more unused), ajs tells
 you in your inbox after 5 minutes (or at the end), and again if that unused memory is
-what keeps another job queued; size your queued and next submissions from that. A job
+what keeps another job queued. Lower the running or queued job in place with
+`set_job_mem`, and size your next submissions from the peak. A job
 that loads slowly can move the check with meta `mem_check=20m`, or turn it off with
 `mem_check=off`.
 
@@ -376,6 +377,23 @@ def build_server() -> Any:
             return {"ok": False, "error": "reason is required: say why the job needs a different ceiling"}
         try:
             job = _client().set_runtime(job_id, parse_duration(max_runtime), actor=session_id, reason=reason)
+            return {"ok": True, "job": _summarise(job)}
+        except (SchedulerError, ValueError) as exc:
+            return _err(exc)
+
+    @mcp.tool
+    def set_job_mem(job_id: int, mem: str, reason: str) -> dict[str, Any]:
+        """Lower YOUR OWN queued or running job's memory reservation, e.g. "8G".
+
+        Use it when a mem-underuse or mem-blocking note says the job reserves far more
+        than it uses: the freed memory lets queued jobs start at once. Lowering only; a
+        running job cannot go below its peak so far plus a margin. `reason` is required
+        and recorded in `ajs events`.
+        """
+        if not reason.strip():
+            return {"ok": False, "error": "reason is required: say why the reservation can be lower"}
+        try:
+            job = _client().set_mem(job_id, parse_mem(mem), actor=session_id, reason=reason)
             return {"ok": True, "job": _summarise(job)}
         except (SchedulerError, ValueError) as exc:
             return _err(exc)

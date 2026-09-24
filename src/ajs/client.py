@@ -112,6 +112,9 @@ class Client:
     def set_runtime(self, job_id: int, max_runtime_s: int, *, actor: str, reason: str) -> dict[str, Any]:
         return self.call("set_runtime", job_id=job_id, max_runtime_s=max_runtime_s, actor=actor, reason=reason)
 
+    def set_mem(self, job_id: int, mem_mb: int, *, actor: str, reason: str) -> dict[str, Any]:
+        return self.call("set_mem", job_id=job_id, mem_mb=mem_mb, actor=actor, reason=reason)
+
     def events(self, job_id: int | None = None, limit: int = 50) -> list[dict[str, Any]]:
         return list(self.call("events", job_id=job_id, limit=limit))
 

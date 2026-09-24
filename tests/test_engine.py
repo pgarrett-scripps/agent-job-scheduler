@@ -608,7 +608,7 @@ class TestMemUnderuse:
     def test_owner_hears_once_when_unused_memory_blocks_a_queued_job(self, engine, monkeypatch):
         (event,) = self._blocking(engine, monkeypatch, 500, 2000)
         assert "job 2 (q, 2 GB) is waiting for memory" in event["detail"]
-        assert "reserve about 1G" in event["reason"]
+        assert "ajs resize 1 --mem 1G" in event["reason"]
         assert any(e["action"] == "mem-blocking" for e in engine.store.session_events("s", since=0))
 
     def test_no_note_when_freeing_the_unused_memory_would_not_be_enough(self, engine, monkeypatch):
@@ -749,3 +749,66 @@ async def test_finish_time_is_stamped_after_the_process_tree_drains(engine, monk
     job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp")
     result = await drive(engine, job.id)
     assert result["finished_at"] >= during["at"]
+
+
+class TestResize:
+    """Owners can lower a job's memory reservation in place."""
+
+    def _job(self, engine, *, mem_mb=8000, running=False, peak_mb=None, age_s=600, session="s"):
+        from ajs.contention import ContentionMonitor
+
+        job = engine.submit(project="p", session_id=session, cmd=["/bin/true"], cwd="/tmp", mem_mb=mem_mb)
+        if running:
+            engine.store.update_job(job.id, state="running", started_at=time.time() - age_s)
+            monitor = ContentionMonitor(2.0)
+            monitor.start(None, time.time() - age_s)
+            monitor.mem_peak_mb = peak_mb
+            engine.monitors[job.id] = monitor
+        return engine.store.get_job(job.id)
+
+    def test_lowers_a_queued_job_and_logs_it(self, engine):
+        job = self._job(engine)
+        job = engine.set_mem(job.id, 2048, actor="s", reason="peaks at 1.5G")
+        assert job.resources.mem_mb == 2048
+        (event,) = [e for e in engine.store.events(job_id=job.id) if e["action"] == "mem"]
+        assert event["detail"] == "7.8 -> 2.0 GB" and event["actor"] == "s"
+
+    def test_cannot_raise(self, engine):
+        job = self._job(engine, mem_mb=2048)
+        with pytest.raises(ValueError, match="can only lower"):
+            engine.set_mem(job.id, 4096, actor="s", reason="x")
+
+    def test_only_the_owner_or_a_person(self, engine):
+        job = self._job(engine, session="claude:owner")
+        with pytest.raises(ValueError, match="only its owner"):
+            engine.set_mem(job.id, 2048, actor="claude:other", reason="x")
+        assert engine.set_mem(job.id, 2048, actor="user:patrick", reason="x").resources.mem_mb == 2048
+
+    def test_running_job_not_below_its_peak_plus_margin(self, engine):
+        job = self._job(engine, running=True, peak_mb=3000)
+        with pytest.raises(ValueError, match="4112 MB at the least"):
+            engine.set_mem(job.id, 4000, actor="s", reason="x")
+        assert engine.set_mem(job.id, 4200, actor="s", reason="x").resources.mem_mb == 4200
+
+    def test_running_job_needs_a_minute_of_watching(self, engine):
+        job = self._job(engine, running=True, peak_mb=100, age_s=10)
+        with pytest.raises(ValueError, match="not been watched long enough"):
+            engine.set_mem(job.id, 2048, actor="s", reason="x")
+
+    def test_lowered_limit_reaches_the_cgroup(self, engine, monkeypatch):
+        job = self._job(engine, running=True, peak_mb=1000)
+        calls = []
+        monkeypatch.setattr(engine.executor, "set_mem_limit", lambda unit, mb: calls.append((unit, mb)) or True)
+        engine.running[job.id] = RunningProcess(
+            job_id=job.id,
+            proc=None,  # ty: ignore[invalid-argument-type]  set_mem never touches the process
+            unit="ajs-x-job-1.scope",
+            log_path=Path("/dev/null"),
+            log_file=None,
+        )
+        engine.set_mem(job.id, 2048, actor="s", reason="x")
+        assert calls == [("ajs-x-job-1.scope", 2048)]
+        monkeypatch.setattr(engine.executor, "set_mem_limit", lambda unit, mb: False)
+        with pytest.raises(ValueError, match="could not lower"):
+            engine.set_mem(job.id, 1800, actor="s", reason="x")
+        assert engine.store.get_job(job.id).resources.mem_mb == 2048

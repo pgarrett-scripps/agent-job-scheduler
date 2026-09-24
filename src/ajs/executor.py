@@ -383,6 +383,19 @@ class Executor:
         with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(rp.proc.pid, sig)
 
+    def set_mem_limit(self, unit: str, mem_mb: int) -> bool:
+        """Lower a running job's MemoryMax in place. False if systemd refused."""
+        try:
+            done = subprocess.run(
+                ["systemctl", "--user", "set-property", "--runtime", unit, f"MemoryMax={mem_mb}M"],
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return done.returncode == 0
+
     async def _systemctl(self, *args: str) -> None:
         with contextlib.suppress(OSError):
             proc = await asyncio.create_subprocess_exec(

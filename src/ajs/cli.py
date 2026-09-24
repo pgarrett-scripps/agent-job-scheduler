@@ -465,6 +465,27 @@ def extend_cmd(
     console.print(f"job {job_id} max_runtime -> [bold]{job['max_runtime_s'] // 60} min[/bold]")
 
 
+@app.command(name="resize")
+def resize_cmd(
+    job_id: Annotated[int, typer.Argument(help="Your queued or running job.")],
+    mem: Annotated[str, typer.Option("--mem", help="New memory reservation, lower than now: 8G, 512M.")],
+    reason: Annotated[str, typer.Option("--reason", "-r", help="Why; recorded in `ajs events`.")] = "",
+) -> None:
+    """Lower your own job's memory reservation. Example: ajs resize 914 --mem 8G -r "peaks at 5G"
+
+    Lowering only; a running job's cgroup limit drops with it, but not below its peak so
+    far plus a margin. Frees the memory for queued jobs at once."""
+    if not reason.strip():
+        _fail("--reason is required")
+        return
+    try:
+        job = _client().set_mem(job_id, parse_mem(mem), actor=session_identity(), reason=reason)
+    except (ValueError, protocol.SchedulerError) as exc:
+        _fail(str(exc))
+        return
+    console.print(f"job {job_id} mem -> [bold]{job['mem_mb']} MB[/bold]")
+
+
 @app.command(name="events")
 def events_cmd(
     job_id: Annotated[int | None, typer.Argument(help="Only this job.")] = None,
