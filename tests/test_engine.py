@@ -557,6 +557,7 @@ class TestMemUnderuse:
         job = engine.submit(project="p", session_id="s", cmd=["/bin/true"], cwd="/tmp", mem_mb=4000, meta=meta)
         engine.store.update_job(job.id, started_at=time.time() - age_s)
         monitor = ContentionMonitor(2.0)
+        monitor.start(None, time.time() - age_s)
         monitor.mem_peak_mb = peak_mb
         return engine.store.get_job(job.id), monitor
 
@@ -581,6 +582,13 @@ class TestMemUnderuse:
 
     def test_a_job_using_its_reservation_is_left_alone(self, engine):
         job, monitor = self._job(engine, 1500, age_s=600)
+        engine._check_mem_underuse(job, monitor, time.time(), final=True)
+        assert not self._warnings(engine, job.id)
+
+    def test_an_adopted_job_is_judged_on_the_time_since_adoption(self, engine):
+        job, monitor = self._job(engine, 0, age_s=600)
+        monitor.start(None, time.time())  # a restarted daemon just took it over
+        engine._check_mem_underuse(job, monitor, time.time(), final=False)
         engine._check_mem_underuse(job, monitor, time.time(), final=True)
         assert not self._warnings(engine, job.id)
 

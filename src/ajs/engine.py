@@ -396,7 +396,10 @@ class Engine:
         if job.started_at is None or peak is None or reserved < self.cfg.mem_underuse_min_mb:
             return
         after = mem_check_after(job.meta.get("mem_check"), self.cfg.mem_underuse_after_s)
-        if after is None or (not final and now - job.started_at < after):
+        # The peak covers only what this daemon has watched: after a restart that starts
+        # at the adoption, and one sample taken between two steps of a script reads zero.
+        watched = now - max(job.started_at, monitor.watched_since)
+        if after is None or watched < (MEM_UNDERUSE_MIN_WATCH_S if final else after):
             return
         if peak >= reserved * self.cfg.mem_underuse_ratio:
             return
@@ -899,6 +902,10 @@ def _clock(ts: float | None) -> str:
         return "-"
     fmt = "%H:%M" if time.localtime(ts)[:3] == time.localtime()[:3] else "%a %d %b %H:%M"
     return time.strftime(fmt, time.localtime(ts))
+
+
+MEM_UNDERUSE_MIN_WATCH_S = 60.0
+"""A job watched for less than this at its end has too few samples to judge."""
 
 
 def mem_check_after(value: str | None, default_s: int) -> int | None:

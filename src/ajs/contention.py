@@ -180,6 +180,12 @@ class ContentionMonitor:
             self._last_cpu, self._last_cpu_at = self._cgroup_start, now
 
     @property
+    def watched_since(self) -> float:
+        """When this monitor took its first sample. After a daemon restart that is the
+        adoption, not the job's start, so anything measured covers only this span."""
+        return self._t_start
+
+    @property
     def cgroup(self) -> Path | None:
         """The job's cgroup, used to tell its GPU processes apart from everyone else's."""
         return self._cgroup
