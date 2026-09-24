@@ -195,3 +195,13 @@ def test_peak_memory_counts_the_jobs_own_memory_not_page_cache(tmp_path):
         monitor.poll(0.0)
     assert monitor.mem_now_mb == 14000
     assert monitor.mem_peak_mb == 1000
+
+
+def test_held_memory_leaves_out_page_cache():
+    from ajs.contention import ContentionMonitor
+
+    monitor = ContentionMonitor(2.0)
+    monitor.mem_now_mb = 10_000  # memory.current: anon plus reclaimable page cache
+    assert monitor.mem_held_mb == 10_000  # no memory.stat: charge everything
+    monitor.mem_anon_now_mb = 7_000
+    assert monitor.mem_held_mb == 7_000

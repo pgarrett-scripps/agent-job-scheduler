@@ -251,14 +251,13 @@ class Engine:
         own_mem = 0
         own_cgroups: set[Path] = set()
         for monitor in self.monitors.values():
-            cpu, mem = monitor.poll(now)
+            cpu, _ = monitor.poll(now)
             if monitor.cgroup is None or monitor.cgroup in own_cgroups:
                 continue
             own_cgroups.add(monitor.cgroup)
             if cpu is not None:
                 own_cpu += cpu
-            if mem is not None:
-                own_mem += mem // (1024 * 1024)
+            own_mem += monitor.mem_held_mb or 0
         self._own_cgroups = own_cgroups
         if self.cfg.track_external_load:
             self.external.sample(now, own_cpu, own_mem, own_cgroups)
@@ -1018,7 +1017,7 @@ class Engine:
         `top` would show.
         """
         ajs_cpu = sum(m.cpu_cores_now or 0.0 for m in self.monitors.values())
-        ajs_mem = sum(m.mem_now_mb or 0 for m in self.monitors.values())
+        ajs_mem = sum(m.mem_held_mb or 0 for m in self.monitors.values())
         total_mem = sysinfo.total_mem_mb()
         available = sysinfo.available_mem_mb()
         return {

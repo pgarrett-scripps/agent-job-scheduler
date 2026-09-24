@@ -163,6 +163,14 @@ class ContentionMonitor:
         """Most anonymous memory the job has held, for telling owners they reserved too
         much. Page cache is left out: it grows to fill any limit and is reclaimable."""
 
+    @property
+    def mem_held_mb(self) -> int | None:
+        """Memory the job holds and the machine cannot take back: anonymous memory when
+        the cgroup reports it, else everything charged to it. Page cache is left out, as
+        MemAvailable already counts it as free; including it would make ajs's share
+        larger than all memory in use and hide what is running outside ajs."""
+        return self.mem_anon_now_mb if self.mem_anon_now_mb is not None else self.mem_now_mb
+
     def start(self, pid: int | None, now: float, *, cgroup: Path | None = None) -> None:
         """Take the opening samples.
 
