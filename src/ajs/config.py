@@ -156,9 +156,11 @@ class Config:
     """Share of CPU time spent waiting on disk above which the machine is not quiet.
     Only checked before the start: once the job runs, its own I/O shows up here too."""
 
-    quiet_max_wait_s: float = 1800.0
+    quiet_max_wait_s: float = 600.0
     """Give up waiting for quiet after this long and start anyway, noting it on the job.
-    Without a cap, a permanently busy desktop would wedge the queue behind one job."""
+    Without a cap, a permanently busy desktop would wedge the queue behind one job.
+    The machine sits idle for as long as this, so it is kept short: a timing run that
+    never got its quiet window is flagged, and its owner can rerun it."""
 
     contention_threshold: float = 4.0
     """Foreign CPU cores (work not attributable to the job's own cgroup) above which an
