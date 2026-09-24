@@ -380,3 +380,50 @@ class TestQuietGate:
     def test_non_exclusive_jobs_ignore_the_gate(self, cap, cfg):
         decision = run_plan([make_job(1, cpu=2)], cap=cap, cfg=cfg, quiet_since=None, noise="x")
         assert decision.start == [1]
+
+
+class TestCpuOverbooking:
+    """Jobs book declared cores up to three times the real ones; memory stays real."""
+
+    @staticmethod
+    def _cfg(cfg):
+        from dataclasses import replace
+
+        return replace(cfg, cpu_overbook=3.0)
+
+    def test_jobs_share_cores_they_booked(self, cfg, cap):
+        queued = [make_job(i, project=f"p{i}", cpu=16, mem_mb=4000) for i in (1, 2, 3)]
+        assert run_plan(queued, cap=cap, cfg=self._cfg(cfg)).start == [1, 2, 3]
+
+    def test_memory_is_never_overbooked(self, cfg, cap):
+        queued = [make_job(i, project=f"p{i}", cpu=2, mem_mb=30000) for i in (1, 2)]
+        decision = run_plan(queued, cap=cap, cfg=self._cfg(cfg))
+        assert decision.start == [1] and 2 in decision.blocked
+
+    def test_a_timing_run_still_waits_for_every_other_job(self, cfg, cap):
+        running = [make_job(1, cpu=1, state=JobState.RUNNING, started_at=NOW)]
+        decision = run_plan([make_job(2, exclusive=True)], running, cap=cap, cfg=self._cfg(cfg))
+        assert decision.start == []
+        running = [make_job(1, exclusive=True, state=JobState.RUNNING, started_at=NOW)]
+        decision = run_plan([make_job(2, cpu=1)], running, cap=cap, cfg=self._cfg(cfg))
+        assert decision.start == []
+
+    def test_more_declared_cores_than_the_machine_is_still_impossible(self, cfg, cap):
+        decision = run_plan([make_job(1, cpu=21)], cap=cap, cfg=self._cfg(cfg))
+        assert decision.blocked[1].startswith("impossible")
+
+    def test_a_saturated_machine_starts_nothing_more(self, cfg, cap):
+        decision = run_plan([make_job(1, cpu=2)], cap=cap, cfg=self._cfg(cfg), cpu_busy=18.5)
+        assert decision.start == [] and decision.blocked[1].startswith("machine busy")
+
+    def test_starts_in_one_pass_count_toward_the_busy_limit(self, cfg, cap):
+        queued = [make_job(i, project=f"p{i}", cpu=15, mem_mb=1000) for i in (1, 2, 3)]
+        decision = run_plan(queued, cap=cap, cfg=self._cfg(cfg), cpu_busy=9.0)
+        # 9 measured + 5 per start (15 declared / 3): 14, then 19 passes the 18-core limit.
+        assert decision.start == [1, 2] and decision.blocked[3].startswith("machine busy")
+
+    def test_a_timing_run_ignores_the_busy_gate(self, cfg, cap):
+        decision = run_plan(
+            [make_job(1, exclusive=True)], cap=cap, cfg=self._cfg(cfg), cpu_busy=19.0, last_finish_at=0.0
+        )
+        assert 1 not in decision.blocked or not decision.blocked[1].startswith("machine busy")

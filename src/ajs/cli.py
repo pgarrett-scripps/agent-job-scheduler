@@ -631,7 +631,7 @@ def status_cmd(json_out: Annotated[bool, typer.Option("--json")] = False) -> Non
         flags.append("[yellow]DRAINING[/yellow]")
     header = "  ".join(flags)
     console.print(
-        f"[bold]cpu[/bold] {used['cpu']}/{cap['cpu']}   "
+        f"[bold]cpu[/bold] {used['cpu']}/{data.get('cpu_book', cap['cpu'])} booked ({cap['cpu']} cores)   "
         f"[bold]mem[/bold] {used['mem_mb']}/{cap['mem_mb']} MB   "
         f"[bold]gpu[/bold] {used['gpu']}/{cap['gpu']} "
         f"({used.get('gpu_mem_mb', 0)}/{cap.get('gpu_mem_mb', 0)} MB)   "

@@ -28,6 +28,7 @@ def engine(tmp_path):
         max_jobs_per_project=4,
         use_systemd=False,  # plain process groups: faster and hermetic under pytest
         track_external_load=False,  # otherwise the test host's own load decides the outcome
+        cpu_overbook=1.0,
     )
     store = Store(tmp_path / "jobs.db")
     ex = Executor(cfg, tmp_path / "logs", use_systemd=False)

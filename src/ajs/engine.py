@@ -22,7 +22,7 @@ from .contention import ContentionMonitor, ExternalLoad, ForeignProcesses
 from .db import Store
 from .executor import Executor, RunningProcess, read_exit_file
 from .models import Job, JobClass, JobState, ResourceRequest, short_actor
-from .scheduler import Capacity, Decision, effective_request, plan
+from .scheduler import Capacity, Decision, booking_capacity, effective_request, plan
 
 log = logging.getLogger("ajs.engine")
 
@@ -212,6 +212,7 @@ class Engine:
             noise=self.noise,
             settling_since=self.settling_since,
             mem_headroom_mb=self._mem_headroom(running),
+            cpu_busy=self._cpu_busy(),
         )
         self.last_decision = decision
         self.settling_since = {j: self.settling_since.get(j, now) for j in decision.settling}
@@ -310,6 +311,12 @@ class Engine:
             cpu_allowance=self.cfg.external_cpu_allowance,
             mem_allowance_mb=self.cfg.mem_reserve_mb,
         )
+
+    def _cpu_busy(self) -> float | None:
+        """Cores really in use, by ajs jobs and everything else; None until measured."""
+        if not self.cfg.track_external_load or not self.external.ready:
+            return None
+        return sum(m.cpu_cores_now or 0.0 for m in self.monitors.values()) + self.external.cpu_cores
 
     def _lease_usage(self) -> dict[str, int]:
         usage = {"cpu": 0, "mem_mb": 0, "gpu": 0, "gpu_mem_mb": 0}
@@ -862,14 +869,19 @@ class Engine:
             used[key] += leases[key]
         external = self._external_usage() or {"cpu": 0, "mem_mb": 0, "gpu": 0, "gpu_mem_mb": 0}
         cap = self.cap.as_dict()
+        book = booking_capacity(self.cap, self.cfg).as_dict()
+        # Declared cores are booked against the overbooked pool, and foreign cores cost
+        # the same share of it as they do of the machine.
+        scale = {k: book[k] / cap[k] if cap[k] else 1.0 for k in cap}
         return {
             "capacity": cap,
+            "cpu_book": book["cpu"],
             "used": used,
             "external": external,
             # Free is what the scheduler will actually hand out, so foreign load is
             # subtracted here too -- reporting it as free is the very confusion this
             # measurement exists to remove.
-            "free": {k: max(0, cap[k] - used[k] - external.get(k, 0)) for k in used},
+            "free": {k: max(0, book[k] - used[k] - external.get(k, 0) * scale[k]) for k in used},
             "running": [self._with_usage(j) for j in running],
             "queued": [{**j.to_dict(), "blocked_reason": self.blocked_reason(j.id)} for j in queued],
             "reservation": (

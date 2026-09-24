@@ -29,6 +29,7 @@ def cfg():
         settle_seconds=10.0,
         max_jobs_per_project=4,
         contention_threshold=2.0,
+        cpu_overbook=1.0,  # one booked core per real core; overbooking has its own tests
     )
 
 

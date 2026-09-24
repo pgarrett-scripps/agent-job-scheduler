@@ -128,6 +128,17 @@ class Config:
     is not flagged. A job can move its own check with ``--meta mem_check=20m`` (or
     ``off``); jobs that end sooner are judged when they finish."""
 
+    cpu_overbook: float = 3.0
+    """Declared cores the scheduler hands out per real core, for jobs that are not timing
+    runs. Jobs ask for more cores than they keep busy, and a machine booked full of idle
+    reservations runs one job at a time; overbooking lets them share cores instead, and
+    a busy machine only slows them. Memory is never overbooked. 1.0 turns this off."""
+
+    cpu_busy_frac: float = 0.9
+    """With overbooking, stop starting jobs once measured CPU use (ajs jobs plus everything
+    else) reaches this share of the real cores, so bookings cannot pile onto a machine
+    that is actually saturated."""
+
     runtime_warn_s: int = 600
     """Warn a job's owner this long before max_runtime kills it, so it can `ajs extend`
     or save its work. Jobs shorter than five times this are warned at 80% instead."""

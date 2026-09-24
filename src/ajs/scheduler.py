@@ -187,6 +187,7 @@ def plan(
     noise: str = "",
     settling_since: dict[int, float] | None = None,
     mem_headroom_mb: int | None = None,
+    cpu_busy: float | None = None,
 ) -> Decision:
     """Decide which queued jobs may start right now.
 
@@ -205,12 +206,24 @@ def plan(
     ``mem_headroom_mb`` is memory really available to a new job: the kernel's
     MemAvailable, less what running jobs may still grow into and the guard. None means
     unmeasured and skips the check.
+
+    CPU is booked in declared cores up to ``cpu_overbook`` times the real ones (see
+    :func:`booking_capacity`); ``cpu_busy`` is the measured core use that stops starts
+    once the machine is really saturated. None skips that check.
     """
     decision = Decision()
+    book = booking_capacity(cap, cfg)
+    factor = book.cpu / cap.cpu if cap.cpu else 1.0
 
-    free = cap.as_dict()
+    def charge(job: Job) -> dict[str, int]:
+        return booked_request(job, cap, book)
+
+    busy_limit = cap.cpu * cfg.cpu_busy_frac
+    busy = cpu_busy
+
+    free = book.as_dict()
     for job in running:
-        _deduct(free, effective_request(job, cap))
+        _deduct(free, charge(job))
     leases = {k: v for k, v in (lease_usage or {}).items() if k in free}
     for key, amount in leases.items():
         free[key] -= amount
@@ -218,6 +231,7 @@ def plan(
     # Two pools, differing only in whether foreign CPU and memory are charged: exclusive
     # jobs draw from the one that ignores them (see _external_for).
     free_exclusive = dict(free)
+    external_usage = _scale_cpu(external_usage, factor)
     for key, amount in (external_usage or {}).items():
         if key in free:
             free[key] -= amount
@@ -228,9 +242,7 @@ def plan(
     # plus, later in the pass, exclusive jobs parked in their settle period. Reservations
     # are projected from this list, so a hold that is missing from it produces a promise
     # the scheduler cannot keep.
-    holds: list[tuple[dict[str, int], float]] = [
-        (effective_request(job, cap), _projected_end(job, now)) for job in running
-    ]
+    holds: list[tuple[dict[str, int], float]] = [(charge(job), _projected_end(job, now)) for job in running]
 
     # Lock name -> holders. A plain lock admits one; a name in cfg.extra_semaphores
     # admits that many, e.g. {"api:anthropic": 3} caps concurrent API-hammering jobs.
@@ -258,12 +270,13 @@ def plan(
     holder = next((j for j in running if j.resources.exclusive), None)
 
     for job in order_queue(queued, last_start):
-        need = effective_request(job, cap)
+        declared = effective_request(job, cap)
 
         # --- checks that do not depend on current availability -------------
-        if any(need[k] > cap.as_dict()[k] for k in _COUNTED):
-            decision.blocked[job.id] = f"impossible: needs {need} but machine has {cap.as_dict()}"
+        if any(declared[k] > cap.as_dict()[k] for k in _COUNTED):
+            decision.blocked[job.id] = f"impossible: needs {declared} but machine has {cap.as_dict()}"
             continue
+        need = charge(job)
 
         required_disk = cfg.disk_floor_mb + job.resources.disk_mb
         if free_disk_mb < required_disk:
@@ -295,7 +308,7 @@ def plan(
                 else _external_note(external)
             )
             if reservation is None:
-                reservation = _reserve(job, need, cap, now, holds=holds, static={**leases, **external})
+                reservation = _reserve(job, need, book, now, holds=holds, static={**leases, **external})
                 decision.reservation = reservation
                 if not reservation.external:
                     decision.blocked[job.id] = (
@@ -340,6 +353,12 @@ def plan(
             decision.blocked[job.id] = why
             continue
 
+        if busy is not None and not job.resources.exclusive and busy >= busy_limit:
+            # Overbooking assumes jobs leave cores idle. When they do not, adding more
+            # only slows everyone; wait for real use to fall.
+            decision.blocked[job.id] = f"machine busy: {busy:.1f} of {cap.cpu} cores in use (limit {busy_limit:.0f})"
+            continue
+
         if job.resources.exclusive:
             since_finish = now - last_finish_at if last_finish_at else float("inf")
             since_quiet = now - quiet_since if quiet_since is not None else 0.0
@@ -374,6 +393,8 @@ def plan(
                 continue
 
         decision.start.append(job.id)
+        if busy is not None:
+            busy += declared["cpu"] / factor  # a guess at its use until it is measured
         _deduct(free, need)
         _deduct(free_exclusive, need)
         take_locks(job_locks)
@@ -383,6 +404,30 @@ def plan(
             mem_headroom_mb -= real_mem
 
     return decision
+
+
+def booking_capacity(cap: Capacity, cfg: Config) -> Capacity:
+    """The pool jobs are booked from: real capacity, with CPU overbooked by
+    ``cfg.cpu_overbook``. Memory, GPU and VRAM stay real."""
+    cpu = max(cap.cpu, int(cap.cpu * max(1.0, cfg.cpu_overbook)))
+    return Capacity(cpu=cpu, mem_mb=cap.mem_mb, gpu=cap.gpu, gpu_mem_mb=cap.gpu_mem_mb)
+
+
+def booked_request(job: Job, cap: Capacity, book: Capacity) -> dict[str, int]:
+    """What a job is charged against the booking pool. Its declared cores, except that
+    a timing run books the whole pool, so it still runs with nothing else."""
+    need = effective_request(job, cap)
+    if job.resources.exclusive:
+        need["cpu"] = book.cpu
+    return need
+
+
+def _scale_cpu(usage: dict[str, int] | None, factor: float) -> dict[str, int] | None:
+    """Real cores used outside ajs, in booking units, so they cost the same share of
+    the pool as they do of the machine."""
+    if not usage or "cpu" not in usage:
+        return usage
+    return {**usage, "cpu": int(round(usage["cpu"] * factor))}
 
 
 def _external_note(external_usage: dict[str, int] | None) -> str:
